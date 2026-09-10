@@ -195,7 +195,7 @@ public sealed class MsmtBcCryptographyTests
         Assert.False(MsmtBcCryptography.MatchesServerName(certificate, "other.example.com"));
     }
 
-        private static X509Certificate2 CreateWithDnsSubjectAlternativeName(string dnsName)
+    private static X509Certificate2 CreateWithDnsSubjectAlternativeName(string dnsName)
     {
         using RSA key = RSA.Create(2048);
         CertificateRequest request = new("CN=msmt-wildcard", key, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);

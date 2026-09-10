@@ -6,6 +6,7 @@
     <IsPackable>false</IsPackable>
     <RootNamespace>BlueHeighliner.Msmt.Tests</RootNamespace>
     <AssemblyName>BlueHeighliner.Msmt.Tests</AssemblyName>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
   </PropertyGroup>
 
   <ItemGroup>

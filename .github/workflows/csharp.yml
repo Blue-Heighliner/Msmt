@@ -8,30 +8,85 @@ on:
   release:
     types: [published]
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Package version to publish (e.g. 1.2.3)"
+        required: true
+
+# Serializes runs sharing a ref (so two pushes to main never race to git-push an automated commit at the
+# same time) and additionally cancels superseded PR runs, since only those are safe to throw away mid-run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "10.0.x"
+          cache: true
+          cache-dependency-path: "**/packages.lock.json"
 
+      - name: Configure git for automated commits
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      # RestoreLockedMode fails fast if packages.lock.json (also what the setup-dotnet cache key above is
+      # keyed on) doesn't match what the project references, instead of silently re-resolving and drifting.
       - name: Build
-        run: dotnet build
+        run: dotnet build -p:RestoreLockedMode=true
+
+      # On a push to main there is no PR review to catch formatting drift and nothing else depends on this
+      # exact commit yet, so fix it automatically instead of failing the run. Everywhere else (PRs, releases,
+      # manual publishes) verify strictly instead: a PR needs the contributor to see and fix the diff, and a
+      # release must build from exactly what its tag points at, not a silently reformatted copy of it.
+      - name: Format
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: dotnet format
+
+      - name: Verify formatting
+        if: github.event_name != 'push' || github.ref != 'refs/heads/main'
+        run: dotnet format --verify-no-changes
+
+      # Pushes made with the default GITHUB_TOKEN don't trigger further workflow runs, so this can't loop.
+      # continue-on-error so a transient push race never blocks Test/the publish job below.
+      - name: Commit formatting fixes
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        continue-on-error: true
+        run: |
+          git add -u -- '*.cs'
+          if ! git diff --staged --quiet; then
+            git commit -m "Apply dotnet format fixes"
+            git push
+          fi
 
       - name: Test
         run: dotnet test Tests/Tests.csproj --configuration Debug --collect:"XPlat Code Coverage"
 
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v4
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          fail_ci_if_error: true
+      - name: Generate coverage badge
+        run: |
+          dotnet tool restore
+          dotnet reportgenerator "-reports:Tests/TestResults/**/coverage.cobertura.xml" "-targetdir:.github/badges" "-reporttypes:Badges"
+
+      # Only the README's own badge file is committed - ReportGenerator's other color/metric variants in
+      # .github/badges/ are gitignored. Same can't-loop/continue-on-error reasoning as the formatting commit above.
+      - name: Commit updated coverage badge
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        continue-on-error: true
+        run: |
+          git add .github/badges/badge_linecoverage.svg
+          if ! git diff --staged --quiet; then
+            git commit -m "Update coverage badge"
+            git push
+          fi
 
   publish:
     needs: build-and-test
@@ -41,18 +96,45 @@ jobs:
       contents: write
       packages: write
     steps:
+      # workflow_dispatch can be run against any branch/tag that contains this workflow file - without this
+      # check a manual dispatch from a non-main ref would silently publish code that was never reviewed on main.
+      - name: Ensure manual publish runs from main
+        if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::Manual publish must be dispatched from main (got '${{ github.ref }}')."
+          exit 1
+
       - uses: actions/checkout@v4
 
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "10.0.x"
+          cache: true
+          cache-dependency-path: "**/packages.lock.json"
+
+      # Core.csproj carries no <Version> of its own - the version always comes from here, either the
+      # GitHub Release's own tag or the workflow_dispatch "version" input, and this step fails the run
+      # rather than falling back to any default if that value is missing or malformed.
+      - name: Determine package version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            VERSION="${{ github.event.release.tag_name }}"
+          else
+            VERSION="${{ github.event.inputs.version }}"
+          fi
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$ ]]; then
+            echo "::error::Version '$VERSION' is not a valid version (expected e.g. 1.2.3)."
+            exit 1
+          fi
+          echo "override=-p:Version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Pack
         # GeneratePackageOnBuild (Core/Core.csproj) is only meant to fire from `dotnet build`;
         # combined with an explicit `dotnet pack` invocation it conflicts with `pack`'s own
         # Build-then-Pack target ordering and the build never runs (NU5026: DLL not found).
         # Disabling it here lets `dotnet pack`'s own wiring build first as normal.
-        run: dotnet pack Core/Core.csproj --configuration Release --output nupkgs -p:GeneratePackageOnBuild=false
+        run: dotnet pack Core/Core.csproj --configuration Release --output nupkgs -p:GeneratePackageOnBuild=false -p:RestoreLockedMode=true ${{ steps.version.outputs.override }}
 
       - name: Push to GitHub Packages
         run: >

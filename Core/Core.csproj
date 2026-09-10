@@ -6,11 +6,11 @@
     <RootNamespace>BlueHeighliner.Msmt</RootNamespace>
     <AssemblyName>BlueHeighliner.Msmt</AssemblyName>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
   </PropertyGroup>
 
   <PropertyGroup>
     <PackageId>BlueHeighliner.Msmt</PackageId>
-    <Version>0.1.0</Version>
     <Authors>Chris Markwardt</Authors>
     <Description>C# implementation of the Mercury Secure Message Transport (MSMT) protocol: a TLS 1.3-based secure message transport interface standardized by MITRE.</Description>
     <PackageTags>msmt;networking;tls;protocol;security</PackageTags>

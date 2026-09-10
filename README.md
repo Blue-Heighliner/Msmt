@@ -3,7 +3,7 @@
 [![NuGet](https://img.shields.io/nuget/v/BlueHeighliner.Msmt.svg?label=NuGet)](https://www.nuget.org/packages/BlueHeighliner.Msmt)
 [![License: MIT](https://img.shields.io/github/license/Blue-Heighliner/Msmt.svg)](LICENSE)
 [![C#](https://github.com/Blue-Heighliner/Msmt/actions/workflows/csharp.yml/badge.svg)](https://github.com/Blue-Heighliner/Msmt/actions/workflows/csharp.yml)
-[![codecov](https://codecov.io/gh/Blue-Heighliner/Msmt/branch/main/graph/badge.svg)](https://codecov.io/gh/Blue-Heighliner/Msmt)
+[![Coverage](https://raw.githubusercontent.com/Blue-Heighliner/Msmt/main/.github/badges/badge_linecoverage.svg)](https://github.com/Blue-Heighliner/Msmt/actions/workflows/csharp.yml)
 
 A C# implementation of the Mercury Secure Message Transport (MSMT) standard — an open,
 standards-based interface for secure message transport over IP networks, defined by MITRE's

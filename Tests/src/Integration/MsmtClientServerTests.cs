@@ -429,7 +429,7 @@ public sealed class MsmtClientServerTests
         await unlinked.Task.WaitAsync(TimeSpan.FromSeconds(5));
     }
 
-        /// <summary>Disposing a client that still has a payload sitting in its queue (e.g. because <see cref="MsmtClient.Connect"/> was never called) cancels it rather than abandoning it, disposing its payload and reporting a final <see cref="MsmtSendStatus.Cancelled"/> status.</summary>
+    /// <summary>Disposing a client that still has a payload sitting in its queue (e.g. because <see cref="MsmtClient.Connect"/> was never called) cancels it rather than abandoning it, disposing its payload and reporting a final <see cref="MsmtSendStatus.Cancelled"/> status.</summary>
     [Fact]
     public void Dispose_PayloadStillQueued_CancelsAndDisposesIt()
     {

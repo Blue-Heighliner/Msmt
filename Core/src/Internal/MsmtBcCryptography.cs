@@ -7,7 +7,7 @@ namespace BlueHeighliner.Msmt.Internal;
 /// </summary>
 internal static class MsmtBcCryptography
 {
-    private static readonly short[] PreferredSignatureSchemes =
+    private static readonly short[] preferredSignatureSchemes =
     [
         SignatureAlgorithm.rsa_pss_rsae_sha256,
         SignatureAlgorithm.rsa_pss_rsae_sha384,
@@ -149,7 +149,7 @@ internal static class MsmtBcCryptography
             return null;
         }
 
-        foreach (short preferred in PreferredSignatureSchemes)
+        foreach (short preferred in preferredSignatureSchemes)
         {
             foreach (SignatureAndHashAlgorithm candidate in candidates)
             {
