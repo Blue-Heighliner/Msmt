@@ -3,6 +3,7 @@ name: C#
 on:
   push:
     branches: [main]
+    tags: ["*.*.*"]
   pull_request:
     branches: [main]
   release:
@@ -90,7 +91,10 @@ jobs:
 
   publish:
     needs: build-and-test
-    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+    if: >
+      github.event_name == 'release' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/'))
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -112,22 +116,34 @@ jobs:
           cache: true
           cache-dependency-path: "**/packages.lock.json"
 
-      # Core.csproj carries no <Version> of its own - the version always comes from here, either the
-      # GitHub Release's own tag or the workflow_dispatch "version" input, and this step fails the run
-      # rather than falling back to any default if that value is missing or malformed.
+      # Core.csproj carries no <Version> of its own - the version always comes from here, either a pushed
+      # version tag, an existing GitHub Release's own tag, or the workflow_dispatch "version" input, and
+      # this step fails the run rather than falling back to any default if that value is missing or malformed.
       - name: Determine package version
         id: version
         run: |
           if [ "${{ github.event_name }}" = "release" ]; then
             VERSION="${{ github.event.release.tag_name }}"
-          else
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION="${GITHUB_REF#refs/tags/}"
           fi
           if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$ ]]; then
             echo "::error::Version '$VERSION' is not a valid version (expected e.g. 1.2.3)."
             exit 1
           fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "override=-p:Version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      # A pushed version tag has no GitHub Release yet - create one from it (with auto-generated notes) so
+      # the rest of this job can attach package assets to it the same way it does for a Release published
+      # through the UI. Created with GITHUB_TOKEN, so this can't recursively trigger the `release` event above.
+      - name: Create GitHub release
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release create "${{ steps.version.outputs.version }}" --title "${{ steps.version.outputs.version }}" --generate-notes
 
       - name: Pack
         # GeneratePackageOnBuild (Core/Core.csproj) is only meant to fire from `dotnet build`;
@@ -144,7 +160,7 @@ jobs:
           --skip-duplicate
 
       - name: Upload release assets
-        if: github.event_name == 'release'
+        if: github.event_name == 'release' || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/'))
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${{ github.event.release.tag_name }}" nupkgs/*.nupkg nupkgs/*.snupkg
+        run: gh release upload "${{ steps.version.outputs.version }}" nupkgs/*.nupkg nupkgs/*.snupkg
