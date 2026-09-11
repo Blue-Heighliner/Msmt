@@ -85,7 +85,8 @@ jobs:
 
       # Core.csproj carries no <Version> of its own - the version always comes from the "version" input to
       # this workflow, and this step fails the run rather than falling back to any default if it's missing
-      # or malformed.
+      # or malformed. The matching GitHub Release/tag is expected to already exist - Tasks/Publish.task
+      # creates it locally (as an Admin, since a tag ruleset blocks GITHUB_TOKEN from creating one here).
       - name: Determine package version
         id: version
         env:
@@ -101,13 +102,6 @@ jobs:
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "override=-p:Version=$VERSION" >> "$GITHUB_OUTPUT"
-
-      # Dispatching this workflow is the only way a release gets cut - creates the tag (pointing at the
-      # exact commit this run checked out) and the GitHub Release together, with auto-generated notes.
-      - name: Create GitHub release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release create "${{ steps.version.outputs.version }}" --target "${{ github.sha }}" --title "${{ steps.version.outputs.version }}" --generate-notes
 
       - name: Pack
         # GeneratePackageOnBuild (Core/Core.csproj) is only meant to fire from `dotnet build`;
