@@ -1,6 +1,6 @@
 var TestResultsFolder = TestResults
 
-script Test
+script
 	trace off
 	run dotnet tool restore
 	delete {TestResultsFolder}

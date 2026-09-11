@@ -3,11 +3,8 @@ name: C#
 on:
   push:
     branches: [main]
-    tags: ["*.*.*"]
   pull_request:
     branches: [main]
-  release:
-    types: [published]
   workflow_dispatch:
     inputs:
       version:
@@ -23,6 +20,7 @@ concurrency:
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
     steps:
@@ -46,9 +44,9 @@ jobs:
         run: dotnet build -p:RestoreLockedMode=true
 
       # On a push to main there is no PR review to catch formatting drift and nothing else depends on this
-      # exact commit yet, so fix it automatically instead of failing the run. Everywhere else (PRs, releases,
-      # manual publishes) verify strictly instead: a PR needs the contributor to see and fix the diff, and a
-      # release must build from exactly what its tag points at, not a silently reformatted copy of it.
+      # exact commit yet, so fix it automatically instead of failing the run. Everywhere else (PRs, publishes)
+      # verify strictly instead: a PR needs the contributor to see and fix the diff, and a publish must build
+      # from exactly what's on main, not a silently reformatted copy of it.
       - name: Format
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: dotnet format
@@ -70,7 +68,7 @@ jobs:
           fi
 
       - name: Test
-        run: dotnet test Tests/Tests.csproj --configuration Debug --collect:"XPlat Code Coverage"
+        run: dotnet test Tests/Tests.csproj --configuration Debug --settings Tests/coverage.runsettings --collect:"XPlat Code Coverage"
 
       - name: Generate coverage badge
         run: |
@@ -91,21 +89,32 @@ jobs:
 
   publish:
     needs: build-and-test
-    if: >
-      github.event_name == 'release' ||
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/'))
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: write
       packages: write
     steps:
-      # workflow_dispatch can be run against any branch/tag that contains this workflow file - without this
-      # check a manual dispatch from a non-main ref would silently publish code that was never reviewed on main.
-      - name: Ensure manual publish runs from main
-        if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main'
+      # Dispatching this workflow already requires write access, but publishing is significant enough to
+      # gate further: only proceed if whoever dispatched it has Admin permission on the repo. Org owners
+      # always show up as Admin here too, so this alone covers both repo Admins and org Owners.
+      - name: Ensure publisher has admin access
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "::error::Manual publish must be dispatched from main (got '${{ github.ref }}')."
+          PERMISSION=$(gh api "repos/${{ github.repository }}/collaborators/${{ github.actor }}/permission" --jq .permission)
+          if [ "$PERMISSION" != "admin" ]; then
+            echo "::error::${{ github.actor }} has '$PERMISSION' permission, not 'admin'. Only repo Admins/org Owners may publish."
+            exit 1
+          fi
+
+      # workflow_dispatch can be run against any branch/tag that contains this workflow file - without this
+      # check dispatching from a non-main ref would silently publish code that was never reviewed on main.
+      - name: Ensure publish runs from main
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::Publish must be dispatched from main (got '${{ github.ref }}')."
           exit 1
 
       - uses: actions/checkout@v4
@@ -116,19 +125,18 @@ jobs:
           cache: true
           cache-dependency-path: "**/packages.lock.json"
 
-      # Core.csproj carries no <Version> of its own - the version always comes from here, either a pushed
-      # version tag, an existing GitHub Release's own tag, or the workflow_dispatch "version" input, and
-      # this step fails the run rather than falling back to any default if that value is missing or malformed.
+      # Core.csproj carries no <Version> of its own - the version always comes from the "version" input to
+      # this workflow, and this step fails the run rather than falling back to any default if it's missing
+      # or malformed.
       - name: Determine package version
         id: version
+        env:
+          # Passed through env instead of interpolated directly into the script below - this input is
+          # arbitrary free text, and GitHub expressions are substituted textually before the shell runs, so
+          # interpolating it inline would let a crafted "version" break out of the string and inject commands.
+          VERSION_INPUT: ${{ github.event.inputs.version }}
         run: |
-          if [ "${{ github.event_name }}" = "release" ]; then
-            VERSION="${{ github.event.release.tag_name }}"
-          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            VERSION="${{ github.event.inputs.version }}"
-          else
-            VERSION="${GITHUB_REF#refs/tags/}"
-          fi
+          VERSION="$VERSION_INPUT"
           if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$ ]]; then
             echo "::error::Version '$VERSION' is not a valid version (expected e.g. 1.2.3)."
             exit 1
@@ -136,14 +144,12 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "override=-p:Version=$VERSION" >> "$GITHUB_OUTPUT"
 
-      # A pushed version tag has no GitHub Release yet - create one from it (with auto-generated notes) so
-      # the rest of this job can attach package assets to it the same way it does for a Release published
-      # through the UI. Created with GITHUB_TOKEN, so this can't recursively trigger the `release` event above.
+      # Dispatching this workflow is the only way a release gets cut - creates the tag (pointing at the
+      # exact commit this run checked out) and the GitHub Release together, with auto-generated notes.
       - name: Create GitHub release
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release create "${{ steps.version.outputs.version }}" --title "${{ steps.version.outputs.version }}" --generate-notes
+        run: gh release create "${{ steps.version.outputs.version }}" --target "${{ github.sha }}" --title "${{ steps.version.outputs.version }}" --generate-notes
 
       - name: Pack
         # GeneratePackageOnBuild (Core/Core.csproj) is only meant to fire from `dotnet build`;
@@ -160,7 +166,6 @@ jobs:
           --skip-duplicate
 
       - name: Upload release assets
-        if: github.event_name == 'release' || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/'))
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh release upload "${{ steps.version.outputs.version }}" nupkgs/*.nupkg nupkgs/*.snupkg
