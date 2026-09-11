@@ -49,3 +49,4 @@ Guidance for AI agents working in this repository.
 
 - Only `Core/Core.csproj` carries NuGet package metadata (`PackageId`, description, tags, etc.); never add it to `Tests.csproj`, which must stay unpacked (`IsPackable false`).
 - Never add a `<Version>` to `Core/Core.csproj` — the only way to release is dispatching the `csharp.yml` workflow (`workflow_dispatch`, restricted to repo Admins/org Owners) with a plain `Major.Minor.Patch[-prerelease]` version (no leading `v`, e.g. `1.2.3`; `Tasks/Publish.task` does this interactively). That single trigger creates the tag, the GitHub Release, and publishes the package - pushing a tag directly does not.
+- Run `Tasks/PrePublish.task` first, and let it push its own commit, before dispatching a publish - it applies formatting fixes and regenerates the coverage badge. CI only verifies formatting; it never fixes or commits anything itself (main is protected, so CI's own token can't push to it).

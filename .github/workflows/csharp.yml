@@ -11,8 +11,8 @@ on:
         description: "Package version to publish (e.g. 1.2.3)"
         required: true
 
-# Serializes runs sharing a ref (so two pushes to main never race to git-push an automated commit at the
-# same time) and additionally cancels superseded PR runs, since only those are safe to throw away mid-run.
+# Avoids redundant runs piling up on the same ref, and cancels superseded PR runs since those are safe to
+# throw away mid-run.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -22,70 +22,28 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
-      contents: write
+      contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/setup-dotnet@v5
         with:
           dotnet-version: "10.0.x"
           cache: true
           cache-dependency-path: "**/packages.lock.json"
-
-      - name: Configure git for automated commits
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
 
       # RestoreLockedMode fails fast if packages.lock.json (also what the setup-dotnet cache key above is
       # keyed on) doesn't match what the project references, instead of silently re-resolving and drifting.
       - name: Build
         run: dotnet build -p:RestoreLockedMode=true
 
-      # On a push to main there is no PR review to catch formatting drift and nothing else depends on this
-      # exact commit yet, so fix it automatically instead of failing the run. Everywhere else (PRs, publishes)
-      # verify strictly instead: a PR needs the contributor to see and fix the diff, and a publish must build
-      # from exactly what's on main, not a silently reformatted copy of it.
-      - name: Format
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        run: dotnet format
-
+      # Only checks - never fixes or commits. Run Tasks/PrePublish.task locally to apply formatting fixes
+      # and the coverage badge, and push the result, before dispatching a publish.
       - name: Verify formatting
-        if: github.event_name != 'push' || github.ref != 'refs/heads/main'
         run: dotnet format --verify-no-changes
 
-      # Pushes made with the default GITHUB_TOKEN don't trigger further workflow runs, so this can't loop.
-      # continue-on-error so a transient push race never blocks Test/the publish job below.
-      - name: Commit formatting fixes
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        continue-on-error: true
-        run: |
-          git add -u -- '*.cs'
-          if ! git diff --staged --quiet; then
-            git commit -m "Apply dotnet format fixes"
-            git push
-          fi
-
       - name: Test
-        run: dotnet test Tests/Tests.csproj --configuration Debug --settings Tests/coverage.runsettings --collect:"XPlat Code Coverage"
-
-      - name: Generate coverage badge
-        run: |
-          dotnet tool restore
-          dotnet reportgenerator "-reports:Tests/TestResults/**/coverage.cobertura.xml" "-targetdir:.github/badges" "-reporttypes:Badges"
-
-      # Only the README's own badge file is committed - ReportGenerator's other color/metric variants in
-      # .github/badges/ are gitignored. Same can't-loop/continue-on-error reasoning as the formatting commit above.
-      - name: Commit updated coverage badge
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        continue-on-error: true
-        run: |
-          git add .github/badges/badge_linecoverage.svg
-          if ! git diff --staged --quiet; then
-            git commit -m "Update coverage badge"
-            git push
-          fi
+        run: dotnet test Tests/Tests.csproj --configuration Debug
 
   publish:
     needs: build-and-test
@@ -117,9 +75,9 @@ jobs:
           echo "::error::Publish must be dispatched from main (got '${{ github.ref }}')."
           exit 1
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/setup-dotnet@v5
         with:
           dotnet-version: "10.0.x"
           cache: true

@@ -1,0 +1,12 @@
+script
+	run dotnet format
+	trace off
+	run dotnet tool restore
+	delete Tests/TestResults
+	trace on
+	run dotnet test Tests/Tests.csproj --configuration Debug --settings Tests/coverage.runsettings "--collect:XPlat Code Coverage"
+	trace off
+	run dotnet reportgenerator "-reports:Tests/TestResults/**/coverage.cobertura.xml" "-targetdir:.github/badges" -reporttypes:Badges
+	delete Tests/TestResults
+	trace on
+	. Pre-publish complete - review any formatting/badge changes and commit and push them yourself if there are any, then run Publish.
