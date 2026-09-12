@@ -1,5 +1,0 @@
-script
-	query "Version to publish (e.g. 1.2.3)" Version
-	run gh release create "{Version}" --title "{Version}" --generate-notes
-	run gh workflow run csharp.yml -f version="{Version}"
-	. Triggered a publish run for {Version} - check GitHub Actions for progress.

@@ -2,8 +2,8 @@
 
 [![NuGet](https://img.shields.io/nuget/v/BlueHeighliner.Msmt.svg?label=NuGet)](https://www.nuget.org/packages/BlueHeighliner.Msmt)
 [![License: MIT](https://img.shields.io/github/license/Blue-Heighliner/Msmt.svg)](LICENSE)
-[![C#](https://github.com/Blue-Heighliner/Msmt/actions/workflows/csharp.yml/badge.svg)](https://github.com/Blue-Heighliner/Msmt/actions/workflows/csharp.yml)
-[![Coverage](https://raw.githubusercontent.com/Blue-Heighliner/Msmt/main/.github/badges/badge_linecoverage.svg)](https://github.com/Blue-Heighliner/Msmt/actions/workflows/csharp.yml)
+[![Build](https://github.com/Blue-Heighliner/Msmt/actions/workflows/build.yml/badge.svg)](https://github.com/Blue-Heighliner/Msmt/actions/workflows/build.yml)
+[![Coverage](https://raw.githubusercontent.com/Blue-Heighliner/Msmt/main/.github/badges/badge_linecoverage.svg)](https://github.com/Blue-Heighliner/Msmt/actions/workflows/build.yml)
 
 A C# implementation of the Mercury Secure Message Transport (MSMT) standard — an open,
 standards-based interface for secure message transport over IP networks, defined by MITRE's
@@ -12,33 +12,10 @@ pinned configuration of TLS 1.3 paired with a thin, standardized message-framing
 implements that interface end to end (client, server, and peer-to-peer wrapper) on top of
 BouncyCastle's TLS engine.
 
-## Projects
-
-| Project | Description |
-|---------|-------------|
-| **Core** | The MSMT client, server, and peer-to-peer library. |
-| **Tests** | xUnit tests for Core. |
-
-## Prerequisites
-
-- [.NET 10 SDK](https://dotnet.microsoft.com/download)
-
 ## Installing
 
 ```sh
 dotnet add package BlueHeighliner.Msmt
-```
-
-## Building
-
-```sh
-dotnet build
-```
-
-## Testing
-
-```sh
-dotnet test
 ```
 
 ## Getting started
@@ -64,9 +41,6 @@ peer.StartListener(port: 5000);
 peer.Send(new MsmtTarget { Host = "127.0.0.1", Port = 5000 }, "hello"u8.ToArray());
 ```
 
-See [Docs/Api.md](Docs/Api.md) for the public API's design and flow, and [Docs/Usage.md](Docs/Usage.md)
-for more usage examples.
-
 ## Documentation
 
 | File | Covers |
@@ -74,11 +48,6 @@ for more usage examples.
 | [Docs/Api.md](Docs/Api.md) | The public API's design and flow, built around `IMsmtPeer` |
 | [Docs/Usage.md](Docs/Usage.md) | Usage examples for common scenarios |
 | [Docs/Architecture.md](Docs/Architecture.md) | The high-level design decisions behind the library |
-| [Docs/Implementation.md](Docs/Implementation.md) | How `MsmtPeer`'s real implementation works internally: components, wire framing, TLS layer, concurrency model |
+| [Docs/Components/](Docs/Components/) | Design/implementation detail for individual complex components, one file each |
 | [Docs/ICD.md](Docs/ICD.md) | Full Markdown transcription of the Mercury Secure Message Transport Interface Control Document (v1.2) |
-
-Public and internal types are also fully documented with XML doc comments throughout the source.
-
-## License
-
-[MIT](LICENSE)
+| [Docs/Project.md](Docs/Project.md) | This repository's own tooling and workflow: `Scripts/`, publishing, CI |

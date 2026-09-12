@@ -1,4 +1,4 @@
-name: C#
+name: Build
 
 on:
   push:
@@ -37,8 +37,8 @@ jobs:
       - name: Build
         run: dotnet build -p:RestoreLockedMode=true
 
-      # Only checks - never fixes or commits. Run Tasks/PrePublish.task locally to apply formatting fixes
-      # and the coverage badge, and push the result, before dispatching a publish.
+      # Only checks - never fixes or commits. Run Scripts/Verify.cs locally to apply formatting fixes
+      # and the coverage badge, and push the result, before committing and before dispatching a publish.
       - name: Verify formatting
         run: dotnet format --verify-no-changes
 
@@ -85,7 +85,7 @@ jobs:
 
       # Core.csproj carries no <Version> of its own - the version always comes from the "version" input to
       # this workflow, and this step fails the run rather than falling back to any default if it's missing
-      # or malformed. The matching GitHub Release/tag is expected to already exist - Tasks/Publish.task
+      # or malformed. The matching GitHub Release/tag is expected to already exist - Scripts/Publish.cs
       # creates it locally (as an Admin, since a tag ruleset blocks GITHUB_TOKEN from creating one here).
       - name: Determine package version
         id: version

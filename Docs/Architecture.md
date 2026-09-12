@@ -1,9 +1,7 @@
 # Architecture
 
 This document explains the high-level design decisions behind [`Core/`](../Core)'s implementation of the
-[MSMT ICD](ICD.md) — *why* it's built the way it is, not the class-by-class mechanics of *how*. For the
-public API's shape and flow, see [Api.md](Api.md); for usage examples, see [Usage.md](Usage.md); for the
-detailed internal implementation, see [Implementation.md](Implementation.md).
+MSMT ICD — *why* it's built the way it is, not the class-by-class mechanics of *how*.
 
 ## MSMT is a TLS profile, not a protocol
 
@@ -19,8 +17,7 @@ the way.
 .NET's built-in `SslStream` was considered and rejected: it has no public way to pin the exact two-suite
 cipher list the ICD requires in a fixed preference order, and no way to trigger a TLS 1.3 `KeyUpdate` on
 demand (needed for `MessageWithRekeying`) without a full renegotiation. `Org.BouncyCastle.Tls` exposes
-both as extension points, at the cost of implementing more of the client/server plumbing by hand. See
-[Implementation.md#tls-layer](Implementation.md#tls-layer) for how that plumbing is built.
+both as extension points, at the cost of implementing more of the client/server plumbing by hand.
 
 ## One peer-to-peer type, not separate client/server types
 
@@ -54,9 +51,9 @@ callback registered at construction time. This was chosen over `async` callbacks
 because these notifications are fundamentally "tell me every time X happens, for as long as I care", which
 observables model directly, while `Send`/`Request`/`Test`'s own `Task` results already cover "await this
 one operation's outcome." Deliberately choosing the simplest possible observable — hot, synchronous,
-no buffering or replay (see `MsmtEventSubject<T>` in [Implementation.md](Implementation.md)) — keeps the
-mental model equivalent to a C# multicast event, rather than pulling in a full reactive-extensions
-dependency for behavior the library never needs (scheduling, backpressure, operators).
+no buffering or replay (`MsmtEventSubject<T>`) — keeps the mental model equivalent to a C# multicast event,
+rather than pulling in a full reactive-extensions dependency for behavior the library never needs
+(scheduling, backpressure, operators).
 
 ## Pooled memory, ownership transfer
 
@@ -96,13 +93,4 @@ against.
 `Send` and `Request` only ever enqueue work; the actual TLS handshake, write, and acknowledgement read
 happen on a background loop the caller never touches. This keeps a slow or momentarily unreachable remote
 peer from stalling the caller's thread, and lets sends queue and prioritize against each other rather than
-serializing at the call site. See [Implementation.md#concurrency-model](Implementation.md#concurrency-model)
-for the specific queues and background loops this requires.
-
-## See also
-
-- [ICD.md](ICD.md) — the full Mercury Secure Message Transport Interface Control Document (v1.2).
-- [Api.md](Api.md) — the public API's design and flow.
-- [Usage.md](Usage.md) — usage examples for common scenarios.
-- [Implementation.md](Implementation.md) — the concrete class implementation behind these decisions.
-- [`AGENTS.md`](../AGENTS.md) — coding conventions used throughout this project.
+serializing at the call site.

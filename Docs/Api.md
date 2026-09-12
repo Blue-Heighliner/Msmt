@@ -1,12 +1,9 @@
 # API Reference
 
-The public API of [`Core/`](../Core) is a single peer-to-peer type, `IMsmtPeer`, backed by a factory for
-DI-free or DI-based construction. This document covers the *design and flow* of that surface — how the
-pieces fit together and the order events happen in — using public types only. For runnable examples of
-specific scenarios, see [Usage.md](Usage.md); for why the API is shaped this way, see
-[Architecture.md](Architecture.md); for how `IMsmtPeer`'s real implementation works internally, see
-[Implementation.md](Implementation.md). Every public and internal type is also fully documented with XML
-doc comments in the source — this document does not restate them.
+The public API of [`Core/`](../Core) is a single peer-to-peer type, `IMsmtPeer`. This document covers the
+*design and flow* of that surface — how the pieces fit together and the order events happen in — using
+public types only. Every public and internal type is also fully documented with XML doc comments in the
+source — this document does not restate them.
 
 ## Shape of the API
 
@@ -72,9 +69,8 @@ way to transmit; `IMsmtConnection`/`IMsmtLink` only ever expose `Drop`/`Disconne
 send over it.
 
 `peer.ActiveConnections` snapshots every connection currently holding at least one link;
-`peer.GetActiveConnection` looks one up by target, but only while it holds exactly one linked link (see
-[Usage.md#managing-connections](Usage.md#managing-connections) for the exact matching rule and why both-
-or-neither returns `null`).
+`peer.GetActiveConnection` looks one up by target, but only while it holds exactly one linked link — it
+returns `null` if both or neither of a connection's links are linked.
 
 ## Receiving and acknowledging
 
@@ -101,25 +97,3 @@ message the remote peer would reject as malformed; bundle application-level mess
 marking for QoS. `IMsmtPackage` (returned by `GetPackage`, and carried on `Packages`/`PackageChanged`) is
 the handle for a tagged send: its `Status` (an `MsmtSendStatus`) always reflects the send's current
 progress, and `Cancel()` requests best-effort cancellation.
-
-## Types at a glance
-
-Full member-level documentation lives in each type's XML doc comments; this table is only a map of where
-each concept lives, grouped by role.
-
-| Role | Types |
-|---|---|
-| Entry points | `IMsmtPeer` / `MsmtPeer`, `IMsmtPeerFactory` / `MsmtPeerFactory`, `MsmtOptions`, `MsmtCredentials`, `MsmtServiceCollectionExtensions.AddMsmt` |
-| Addressing | `MsmtTarget`, `MsmtNameTarget` |
-| Connections and links | `IMsmtConnection`, `IMsmtLink`, `MsmtLinkType`, `MsmtIdentity` |
-| Sending | `MsmtSendOptions`, `MsmtSendStatus`, `IMsmtPackage`, `MsmtResponse`, `MsmtLimits` |
-| Receiving | `MsmtReceivedEventArgs`, `IMsmtResponder`, `MsmtResponseKind` |
-| Connection lifecycle modes | `MsmtOperationMode` |
-| Events | `MsmtLinkingEventArgs`, `MsmtLinkedEventArgs`, `MsmtLinkFailedEventArgs`, `MsmtUnlinkedEventArgs`, `MsmtPackageChangedEventArgs`, `MsmtConnectedEventArgs`, `MsmtDisconnectedEventArgs`, `MsmtObservableExtensions` |
-
-## See also
-
-- [Usage.md](Usage.md) — runnable examples for each of the scenarios above, plus disposal and DI.
-- [Architecture.md](Architecture.md) — the design decisions behind this shape.
-- [Implementation.md](Implementation.md) — how `MsmtPeer` actually implements `IMsmtPeer` internally.
-- [ICD.md](ICD.md) — the full Mercury Secure Message Transport Interface Control Document (v1.2).

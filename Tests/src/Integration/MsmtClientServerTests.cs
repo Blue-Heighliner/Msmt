@@ -85,6 +85,9 @@ public sealed class MsmtClientServerTests
 
         await using MsmtClient client = new();
 
+        TaskCompletionSource<object?> clientDisconnected = new();
+        client.Unlinked += (_, _) => clientDisconnected.TrySetResult(null);
+
         await client.Connect(new MsmtConnectOptions
         {
             Target = new MsmtTarget { Host = server.LocalEndPoint!.Address.ToString(), Port = server.LocalEndPoint!.Port },
@@ -104,7 +107,9 @@ public sealed class MsmtClientServerTests
         Assert.Same(connectedLink, disconnectedConnection);
         Assert.False(disconnectedConnection.IsConnected);
 
-        // Message Mode tears the connection down immediately after each send.
+        // The server's Unlinked firing doesn't guarantee the client has torn its own side down yet - the two
+        // sides close independently - so wait for the client's own Unlinked instead of racing its IsConnected.
+        await clientDisconnected.Task.WaitAsync(TimeSpan.FromSeconds(5));
         Assert.False(client.IsConnected);
     }
 

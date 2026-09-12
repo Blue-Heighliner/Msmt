@@ -1,7 +1,6 @@
 # Usage
 
-Runnable examples of `IMsmtPeer` in different situations. See [Api.md](Api.md) for the design and flow
-behind these calls, and [Architecture.md](Architecture.md) for why the API is shaped this way.
+Runnable examples of `IMsmtPeer` in different situations.
 
 ## Loading credentials
 
@@ -228,8 +227,7 @@ same address and port is instead. Returns `null` if no connection for the target
 currently has neither link linked yet or both linked at once.
 
 `MsmtOptions.MaxIdleTime`/`MaxConnectionCount` also evict connections automatically - both the on-demand
-ones a peer creates and the ones its listener accepts - see [Architecture.md](Architecture.md) and
-[Implementation.md#eviction](Implementation.md#eviction).
+ones a peer creates and the ones its listener accepts.
 
 ## Connection lifecycle modes
 
@@ -244,9 +242,6 @@ MsmtOptions options = new()
 
 `SupportsSessionMode`/`MaximumSessionLifetime` instead govern this peer's *listener* — whether it accepts
 a Session Mode negotiation request at all, and the cap it applies to what a connecting client proposes.
-See [Architecture.md#three-connection-lifecycle-modes-trading-security-for-overhead](Architecture.md#three-connection-lifecycle-modes-trading-security-for-overhead) for why each
-mode exists, and [Implementation.md#connection-lifecycle-modes](Implementation.md#connection-lifecycle-modes)
-for how each is implemented.
 
 ## Disposal
 
