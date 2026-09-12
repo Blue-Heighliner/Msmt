@@ -9,8 +9,7 @@ A C# implementation of the Mercury Secure Message Transport (MSMT) standard — 
 standards-based interface for secure message transport over IP networks, defined by MITRE's
 *Mercury Secure Message Transport Interface Control Document (ICD)*. MSMT is a fixed, narrowly
 pinned configuration of TLS 1.3 paired with a thin, standardized message-framing API; this library
-implements that interface end to end (client, server, and peer-to-peer wrapper) on top of
-BouncyCastle's TLS engine.
+implements that interface end to end on top of BouncyCastle's TLS engine.
 
 ## Installing
 
