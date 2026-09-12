@@ -1,4 +1,4 @@
-namespace BlueHeighliner.Msmt.Tests.Unit;
+namespace BlueHeighliner.Msmt.Tests.Unit.Internal;
 
 /// <summary>Unit tests for <see cref="MsmtHeader"/>.</summary>
 public sealed class MsmtHeaderTests

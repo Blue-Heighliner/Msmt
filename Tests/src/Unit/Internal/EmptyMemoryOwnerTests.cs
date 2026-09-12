@@ -1,4 +1,4 @@
-namespace BlueHeighliner.Msmt.Tests.Unit;
+namespace BlueHeighliner.Msmt.Tests.Unit.Internal;
 
 /// <summary>Unit tests for <see cref="EmptyMemoryOwner"/>.</summary>
 public sealed class EmptyMemoryOwnerTests

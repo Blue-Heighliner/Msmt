@@ -1,4 +1,4 @@
-namespace BlueHeighliner.Msmt.Tests.Unit;
+namespace BlueHeighliner.Msmt.Tests.Unit.Internal;
 
 /// <summary>Unit tests for <see cref="MsmtMessageFlags"/>'s composite values, per the ICD's Figure 5-3.</summary>
 public sealed class MsmtMessageFlagsTests

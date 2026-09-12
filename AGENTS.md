@@ -5,7 +5,7 @@
 - Whenever a rule is added, removed, or changed in this file, re-review the whole file afterward and tighten it: merge overlapping or closely related bullets, cut redundant phrasing, and otherwise keep it as condensed as possible without dropping any distinct rule, example, or the reasoning behind a non-obvious rule.
 - Documentation stays in sync with code: review and update the relevant `Docs/` file whenever you change behavior it describes. Keep docs as brief as possible without sacrificing essential details — a concise statement of what/why beats exhaustive narration. Docs describe only current behavior — update the relevant section in place rather than layering "used to be X, now Y" notes, since git history is where past behavior belongs.
 - Do not add "See also" sections, or otherwise mention/link other doc files, from within a doc file.
-- Do not restate code comments (e.g. XML doc comments) in doc files, and do not create type-listing tables — reference types by name in prose instead; docs explain design and flow, not act as a member/type index.
+- Do not restate code comments in doc files, and do not create tables enumerating types ("types at a glance") — that's what XML doc comments and IDE navigation are for; doc files explain design, flow, and rationale instead.
 - New doc files for the design/implementation of a complex component go under `Docs/Components/`, one file per component — separate from the overall workspace documentation in `Docs/` root. A component is a related area of code or a concept, not necessarily a single type; group tightly coupled types together rather than creating one file per type.
 
 ## Coding
