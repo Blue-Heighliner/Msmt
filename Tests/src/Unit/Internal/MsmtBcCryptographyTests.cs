@@ -195,7 +195,7 @@ public sealed class MsmtBcCryptographyTests
         Assert.False(MsmtBcCryptography.MatchesServerName(certificate, "other.example.com"));
     }
 
-    private static X509Certificate2 CreateWithDnsSubjectAlternativeName(string dnsName)
+    private X509Certificate2 CreateWithDnsSubjectAlternativeName(string dnsName)
     {
         using RSA key = RSA.Create(2048);
         CertificateRequest request = new("CN=msmt-wildcard", key, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
@@ -207,6 +207,6 @@ public sealed class MsmtBcCryptographyTests
         return request.CreateSelfSigned(DateTimeOffset.UtcNow.AddMinutes(-5), DateTimeOffset.UtcNow.AddDays(1));
     }
 
-    private static Certificate ToChain(X509Certificate2 certificate) =>
+    private Certificate ToChain(X509Certificate2 certificate) =>
         new(TlsUtilities.EmptyBytes, [new CertificateEntry(MsmtBcCryptography.Crypto.CreateCertificate(certificate.RawData), null)]);
 }

@@ -11,10 +11,13 @@ internal sealed class MsmtServer : IDisposable, IAsyncDisposable
     private readonly List<Task> connectionTasks = [];
     private readonly Lock connectionTasksLock = new();
     private readonly ConcurrentDictionary<MsmtServerConnection, TcpClient> connections = new();
+    private readonly TimeSpan acceptRetryDelay = TimeSpan.FromMilliseconds(100);
+    private readonly TimeSpan sessionExpiryGrace = TimeSpan.FromSeconds(2);
 
     private MsmtHostOptions options = null!;
     private TcpListener? listener;
     private Task? acceptLoop;
+    private int disposed;
 
     /// <summary>Raised whenever a client begins a TLS handshake with this server.</summary>
     public event EventHandler<MsmtLinkingEventArgs> Linking = delegate { };
@@ -55,7 +58,8 @@ internal sealed class MsmtServer : IDisposable, IAsyncDisposable
         this.options = options;
         listener = new TcpListener(MsmtProtocol.ResolveAddress(options.Host), options.Port);
         listener.Start();
-        acceptLoop = Task.Run(() => AcceptLoop(stopCancellation.Token));
+        CancellationToken cancellation = stopCancellation.Token;
+        acceptLoop = Task.Run(() => AcceptLoop(cancellation));
     }
 
     /// <summary>
@@ -65,6 +69,11 @@ internal sealed class MsmtServer : IDisposable, IAsyncDisposable
     /// </summary>
     public void Dispose()
     {
+        if (Interlocked.Exchange(ref disposed, 1) != 0)
+        {
+            return;
+        }
+
         stopCancellation.Cancel();
         listener?.Stop();
         CloseConnectedSockets();
@@ -79,14 +88,18 @@ internal sealed class MsmtServer : IDisposable, IAsyncDisposable
     /// <returns>A task that completes once every connection has finished.</returns>
     public async ValueTask DisposeAsync()
     {
+        if (Interlocked.Exchange(ref disposed, 1) != 0)
+        {
+            return;
+        }
+
         await stopCancellation.CancelAsync();
         listener?.Stop();
 
-        // A connection idle at shutdown is typically blocked in a synchronous read the BouncyCastle TLS
-        // stream doesn't actually abort for a cancelled token (it falls back to a byte[]-based ReadAsync
+        // A connection at shutdown is typically blocked in BouncyCastle's synchronous handshake or in a read
+        // its TLS stream doesn't abort for a cancelled token (it falls back to a byte[]-based ReadAsync
         // overload it never overrides), so cancellation alone would never unblock HandleConnection and this
-        // method would hang forever awaiting it below. Closing the socket directly does forcibly interrupt
-        // that blocked read.
+        // method would hang forever awaiting it below. Closing the socket directly forcibly interrupts both.
         CloseConnectedSockets();
 
         if (acceptLoop is not null)
@@ -132,12 +145,29 @@ internal sealed class MsmtServer : IDisposable, IAsyncDisposable
             {
                 client = await listener!.AcceptTcpClientAsync(cancellation);
             }
-            catch (Exception exception) when (exception is OperationCanceledException or ObjectDisposedException or SocketException)
+            catch (Exception exception) when (exception is OperationCanceledException or ObjectDisposedException || cancellation.IsCancellationRequested)
             {
                 return;
             }
+            catch (SocketException)
+            {
+                // One client's failed accept (e.g. reset before it was accepted) must not stop the listener for
+                // every other client; the delay keeps a persistent failure (e.g. out of file descriptors) from spinning.
+                try
+                {
+                    await Task.Delay(acceptRetryDelay, cancellation);
+                }
+                catch (OperationCanceledException)
+                {
+                    return;
+                }
 
-            Task connectionTask = HandleConnection(client, cancellation);
+                continue;
+            }
+
+            // Run on its own task since BouncyCastle's handshake blocks synchronously; one client stalling
+            // mid-handshake must never delay accepting the next.
+            Task connectionTask = Task.Run(() => HandleConnection(client, cancellation), CancellationToken.None);
             lock (connectionTasksLock)
             {
                 connectionTasks.Add(connectionTask);
@@ -158,7 +188,7 @@ internal sealed class MsmtServer : IDisposable, IAsyncDisposable
     private async Task HandleConnection(TcpClient client, CancellationToken cancellation)
     {
         using TcpClient tcpClient = client;
-        TlsServerProtocol protocol = new(tcpClient.GetStream());
+        using MsmtWatchdog watchdog = new(() => CloseSocket(tcpClient));
         MsmtTlsServer tlsServer = new(options);
 
         IPEndPoint remoteEndPoint = (IPEndPoint)tcpClient.Client.RemoteEndPoint!;
@@ -171,93 +201,140 @@ internal sealed class MsmtServer : IDisposable, IAsyncDisposable
             CloseSocket(tcpClient);
             await disconnectedSource.Task;
         });
-        Linking.Invoke(this, new MsmtLinkingEventArgs { Link = connection });
 
-        try
-        {
-            protocol.Accept(tlsServer);
-        }
-        catch (Exception exception)
-        {
-            LinkFailed.Invoke(this, new MsmtLinkFailedEventArgs { Link = connection, Exception = exception });
-            disconnectedSource.TrySetResult();
-            return;
-        }
-
-        connection.SetIdentity(tlsServer.ClientIdentity!);
-        connection.MarkConnected();
-        Exception? disconnectionException = null;
+        // Registered before the handshake so shutdown can abort one that stalls, then re-checked in case
+        // shutdown's own sweep of connections ran just before this registration.
         connections[connection] = tcpClient;
+        if (cancellation.IsCancellationRequested)
+        {
+            CloseSocket(tcpClient);
+        }
 
         try
         {
-            Linked.Invoke(this, new MsmtLinkedEventArgs { Link = connection });
+            TlsServerProtocol protocol;
+            try
+            {
+                Linking.Invoke(this, new MsmtLinkingEventArgs { Link = connection });
+                MsmtProtocol.ApplyTcpKeepAlive(tcpClient.Client, options.TcpKeepAliveTime);
+                protocol = new(new MsmtWatchedStream(tcpClient.GetStream(), watchdog));
 
-            Stream stream = protocol.Stream;
-            DateTime? sessionExpiresAtUtc = null;
-            bool isFirstMessage = true;
-            byte[] headerBuffer = new byte[MsmtHeader.Size];
+                using (watchdog.Guard(options.HandshakeTimeout, false))
+                {
+                    protocol.Accept(tlsServer);
+                }
+            }
+            catch (Exception exception)
+            {
+                Exception failure = watchdog.HasExpired ? new TimeoutException("The client did not complete its handshake within the configured timeout.", exception) : exception;
+                LinkFailed.Invoke(this, new MsmtLinkFailedEventArgs { Link = connection, Exception = failure });
+                return;
+            }
 
+            connection.SetIdentity(tlsServer.ClientIdentity!);
+            connection.MarkConnected();
+            Exception? disconnectionException = null;
+
+            try
+            {
+                Linked.Invoke(this, new MsmtLinkedEventArgs { Link = connection });
+                disconnectionException = await ServeMessages(connection, watchdog, protocol.Stream, cancellation);
+            }
+            catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
+            {
+            }
+            catch (Exception exception)
+            {
+                disconnectionException = DescribeDisconnection(connection, watchdog, exception);
+            }
+            finally
+            {
+                try
+                {
+                    protocol.Close();
+                }
+                catch (Exception exception) when (exception is IOException or ObjectDisposedException)
+                {
+                }
+
+                connection.MarkDisconnected();
+                Unlinked.Invoke(this, new MsmtUnlinkedEventArgs { Link = connection, Exception = disconnectionException });
+            }
+        }
+        finally
+        {
+            connections.TryRemove(connection, out _);
+            disconnectedSource.TrySetResult();
+        }
+    }
+
+    private Exception? DescribeDisconnection(MsmtServerConnection connection, MsmtWatchdog watchdog, Exception exception)
+    {
+        if (connection.HasCloseReason)
+        {
+            return connection.CloseReason;
+        }
+
+        return watchdog.HasExpired ? new TimeoutException("The client stalled and the connection was dropped.", exception) : exception;
+    }
+
+    /// <summary>Reads and acknowledges messages on an established connection, one at a time, until it closes.</summary>
+    /// <param name="connection">The connection being served.</param>
+    /// <param name="watchdog">Bounds the phases in which the client owes this server something.</param>
+    /// <param name="stream">The connection's secured TLS stream.</param>
+    /// <param name="cancellation">Signals server shutdown.</param>
+    /// <returns>The exception that closed the connection, or <see langword="null"/> if it closed normally.</returns>
+    private async Task<Exception?> ServeMessages(MsmtServerConnection connection, MsmtWatchdog watchdog, Stream stream, CancellationToken cancellation)
+    {
+        DateTime? sessionExpiresAtUtc = null;
+        bool isFirstMessage = true;
+        int messageCount = 0;
+        byte[] headerBuffer = new byte[MsmtHeader.Size];
+        using CancellationTokenSource lifetimeCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
+        Task lifetimeTask = Task.CompletedTask;
+
+        try
+        {
             while (!cancellation.IsCancellationRequested)
             {
                 connection.MarkIdle();
 
-                CancellationTokenSource? idleTimeoutCancellation = null;
-                Task? idleTimeoutTask = null;
-                int[]? timedOut = null;
-                if (options.MaxIdleTime is { } maxIdleTime)
+                // A compliant client only connects to send, so silence right after the handshake is a stall.
+                // Later gaps are legitimate idleness, which the peer's pool eviction and the session
+                // lifetime handle instead.
+                using (watchdog.Guard(isFirstMessage ? options.HandshakeTimeout : null, false))
                 {
-                    idleTimeoutCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
-                    timedOut = new int[1];
-                    idleTimeoutTask = RunIdleTimeout(maxIdleTime, tcpClient, idleTimeoutCancellation.Token, timedOut);
-                }
-
-                try
-                {
-                    try
-                    {
-                        await MsmtProtocol.ReadExact(stream, headerBuffer, cancellation);
-                    }
-                    catch (IOException exception)
-                    {
-                        disconnectionException = timedOut is not null && Volatile.Read(ref timedOut[0]) == 1
-                            ? new TimeoutException($"The connection was idle for longer than {options.MaxIdleTime}.")
-                            : exception;
-                        return;
-                    }
-                    catch (OperationCanceledException)
-                    {
-                        return;
-                    }
-                }
-                finally
-                {
-                    if (idleTimeoutCancellation is not null)
-                    {
-                        await idleTimeoutCancellation.CancelAsync();
-                        idleTimeoutCancellation.Dispose();
-                        await idleTimeoutTask!;
-                    }
+                    await MsmtProtocol.ReadExact(stream, headerBuffer.AsMemory(0, 1), cancellation);
                 }
 
                 connection.MarkBusy();
 
-                MsmtHeader requestHeader = MsmtHeader.Read(headerBuffer);
-
-                if (!requestHeader.IsWellFormed())
+                MsmtHeader requestHeader;
+                IMemoryOwner<byte>? payload = null;
+                using (watchdog.Guard(options.StallTimeout, true))
                 {
-                    await Respond(stream, requestHeader, MsmtMessageFlags.InvalidPreambleOrModeUnsupported, ReadOnlyMemory<byte>.Empty, cancellation);
-                    return;
+                    await MsmtProtocol.ReadExact(stream, headerBuffer.AsMemory(1), cancellation);
+                    requestHeader = MsmtHeader.Read(headerBuffer);
+
+                    if (requestHeader.IsWellFormed())
+                    {
+                        payload = await MsmtProtocol.ReadPooled(stream, (int)requestHeader.Length, cancellation);
+                    }
                 }
 
-                IMemoryOwner<byte> payload = await MsmtProtocol.ReadPooled(stream, (int)requestHeader.Length, cancellation);
+                if (payload is null)
+                {
+                    await Respond(stream, watchdog, requestHeader, MsmtMessageFlags.InvalidPreambleOrModeUnsupported, ReadOnlyMemory<byte>.Empty, cancellation);
+                    return null;
+                }
 
                 if ((requestHeader.Flags & MsmtMessageFlags.SessionModeNegotiation) == MsmtMessageFlags.SessionModeNegotiation)
                 {
+                    DateTime? agreedExpiresAtUtc;
                     bool shouldClose;
                     try
                     {
-                        (sessionExpiresAtUtc, shouldClose) = await RespondToSessionNegotiation(stream, requestHeader, payload.Memory, isFirstMessage, cancellation);
+                        (agreedExpiresAtUtc, shouldClose) = await RespondToSessionNegotiation(stream, watchdog, requestHeader, payload.Memory, isFirstMessage, cancellation);
                     }
                     finally
                     {
@@ -267,7 +344,13 @@ internal sealed class MsmtServer : IDisposable, IAsyncDisposable
                     isFirstMessage = false;
                     if (shouldClose)
                     {
-                        return;
+                        return null;
+                    }
+
+                    if (agreedExpiresAtUtc is { } expiresAtUtc)
+                    {
+                        sessionExpiresAtUtc = expiresAtUtc;
+                        lifetimeTask = CloseAtSessionExpiry(expiresAtUtc - DateTime.UtcNow + sessionExpiryGrace, connection, lifetimeCancellation.Token);
                     }
 
                     continue;
@@ -279,7 +362,7 @@ internal sealed class MsmtServer : IDisposable, IAsyncDisposable
                 {
                     try
                     {
-                        await Respond(stream, requestHeader, MsmtMessageFlags.ReachabilityCheck, payload.Memory, cancellation);
+                        await Respond(stream, watchdog, requestHeader, MsmtMessageFlags.ReachabilityCheck, payload.Memory, cancellation);
                     }
                     finally
                     {
@@ -288,70 +371,51 @@ internal sealed class MsmtServer : IDisposable, IAsyncDisposable
                 }
                 else
                 {
-                    // Ownership of payload transfers into RespondToMessage's Received event; it is not disposed here.
-                    await RespondToMessage(connection, stream, requestHeader, payload, cancellation);
+                    // RespondToMessage disposes payload itself, once every Received subscriber has run.
+                    await RespondToMessage(connection, stream, watchdog, requestHeader, payload, cancellation);
+                    connection.MarkActivity();
                 }
 
-                // Only a negotiated Session Mode lifetime forces a close; Message/MessageWithRekeying rely on the client to close instead.
-                if (sessionExpiresAtUtc is not null && DateTime.UtcNow >= sessionExpiresAtUtc)
+                // Only a negotiated Session Mode lifetime forces a close on its own; otherwise the connection
+                // serves as many messages as the rekey limit allows, and then closes just as its client does.
+                if (sessionExpiresAtUtc is { } expiry)
                 {
-                    return;
+                    if (DateTime.UtcNow >= expiry)
+                    {
+                        return null;
+                    }
+                }
+                else if (++messageCount >= options.RekeyLimit)
+                {
+                    return null;
                 }
             }
-        }
-        catch (Exception exception)
-        {
-            disconnectionException = exception;
-            throw;
+
+            return null;
         }
         finally
         {
-            try
-            {
-                protocol.Close();
-            }
-            catch (IOException)
-            {
-            }
-
-            connection.MarkDisconnected();
-            connections.TryRemove(connection, out _);
-            Unlinked.Invoke(this, new MsmtUnlinkedEventArgs { Link = connection, Exception = disconnectionException });
-            disconnectedSource.TrySetResult();
+            await lifetimeCancellation.CancelAsync();
+            await lifetimeTask;
         }
     }
 
     /// <summary>
-    /// Closes <paramref name="tcpClient"/>'s socket once <paramref name="duration"/> has genuinely elapsed,
-    /// setting <paramref name="timedOut"/>'s single element to <c>1</c> first so the caller can distinguish
-    /// this from any other cause of the resulting read failure. Waits in a chain of clamped-length timers
-    /// rather than a single one (see <see cref="MsmtProtocol.ClampToMaxTimerDuration"/>) so an arbitrarily
-    /// long <paramref name="duration"/> is honored exactly rather than throwing or firing early. BouncyCastle's
-    /// TLS stream falls back to a blocking byte[]-based ReadAsync overload it never overrides internally
-    /// (see <see cref="DisposeAsync"/>), so a cancelled token alone cannot interrupt the caller's
-    /// in-progress read - closing the socket directly, exactly like shutdown does, is the only way to force
-    /// it to unblock.
+    /// Closes an idle connection once its negotiated session lifetime, plus a grace period that lets the
+    /// client close first, has elapsed - a backstop for a client that goes silent, since the lifetime is
+    /// otherwise only checked after a message. Waits in a chain of clamped-length timers rather than a
+    /// single one (see <see cref="MsmtProtocol.ClampToMaxTimerDuration"/>) so an arbitrarily long lifetime
+    /// is honored exactly. A connection mid-message is left to the check that follows the message.
     /// </summary>
-    /// <param name="duration">How long the connection may stay idle before its socket is closed.</param>
-    /// <param name="tcpClient">The socket to close once idle for <paramref name="duration"/>.</param>
-    /// <param name="cancellation">Stops waiting without closing the socket, e.g. once a message arrives.</param>
-    /// <param name="timedOut">A single-element flag this method sets before closing the socket.</param>
-    private async Task RunIdleTimeout(TimeSpan duration, TcpClient tcpClient, CancellationToken cancellation, int[] timedOut)
+    /// <param name="duration">How long from now the connection may stay open.</param>
+    /// <param name="connection">The connection to close.</param>
+    /// <param name="cancellation">Stops waiting without closing anything, once the connection ends.</param>
+    private async Task CloseAtSessionExpiry(TimeSpan duration, MsmtServerConnection connection, CancellationToken cancellation)
     {
-        // Tracked as a remaining TimeSpan, decremented by however long each wait actually clamped to,
-        // rather than an absolute DateTime deadline - duration as large as TimeSpan.MaxValue would overflow
-        // DateTime.UtcNow + duration well before it could ever overflow a TimeSpan subtraction.
         TimeSpan remaining = duration;
 
-        while (!cancellation.IsCancellationRequested)
+        while (remaining > TimeSpan.Zero)
         {
-            if (remaining <= TimeSpan.Zero)
-            {
-                Volatile.Write(ref timedOut[0], 1);
-                CloseSocket(tcpClient);
-                return;
-            }
-
             TimeSpan wait = MsmtProtocol.ClampToMaxTimerDuration(remaining);
 
             try
@@ -365,9 +429,14 @@ internal sealed class MsmtServer : IDisposable, IAsyncDisposable
 
             remaining -= wait;
         }
+
+        if (connection.IsIdle)
+        {
+            connection.CloseWith(null);
+        }
     }
 
-    private async Task Respond(Stream stream, MsmtHeader requestHeader, MsmtMessageFlags flags, ReadOnlyMemory<byte> payload, CancellationToken cancellation)
+    private async Task Respond(Stream stream, MsmtWatchdog watchdog, MsmtHeader requestHeader, MsmtMessageFlags flags, ReadOnlyMemory<byte> payload, CancellationToken cancellation)
     {
         MsmtHeader responseHeader = new()
         {
@@ -379,14 +448,18 @@ internal sealed class MsmtServer : IDisposable, IAsyncDisposable
 
         byte[] headerBuffer = new byte[MsmtHeader.Size];
         responseHeader.Write(headerBuffer);
-        await stream.WriteAsync(headerBuffer, cancellation);
-        if (payload.Length > 0)
+
+        using (watchdog.Guard(options.StallTimeout, true))
         {
-            await stream.WriteAsync(payload, cancellation);
+            await stream.WriteAsync(headerBuffer, cancellation);
+            if (payload.Length > 0)
+            {
+                await stream.WriteAsync(payload, cancellation);
+            }
         }
     }
 
-    private async Task RespondToMessage(MsmtServerConnection connection, Stream stream, MsmtHeader requestHeader, IMemoryOwner<byte> payload, CancellationToken cancellation)
+    private async Task RespondToMessage(MsmtServerConnection connection, Stream stream, MsmtWatchdog watchdog, MsmtHeader requestHeader, IMemoryOwner<byte> payload, CancellationToken cancellation)
     {
         bool isResponseRequested = (requestHeader.Flags & MsmtMessageFlags.AcknowledgementRequestedOrGiven) == MsmtMessageFlags.AcknowledgementRequestedOrGiven;
         MsmtResponder responder = new(isResponseRequested);
@@ -425,21 +498,21 @@ internal sealed class MsmtServer : IDisposable, IAsyncDisposable
         }
 
         using IMemoryOwner<byte> responsePayload = responder.Payload;
-        await Respond(stream, requestHeader, responseFlags, responsePayload.Memory, cancellation);
+        await Respond(stream, watchdog, requestHeader, responseFlags, responsePayload.Memory, cancellation);
     }
 
-    private async Task<(DateTime? ExpiresAtUtc, bool ShouldClose)> RespondToSessionNegotiation(Stream stream, MsmtHeader requestHeader, ReadOnlyMemory<byte> payload, bool isFirstMessage, CancellationToken cancellation)
+    private async Task<(DateTime? ExpiresAtUtc, bool ShouldClose)> RespondToSessionNegotiation(Stream stream, MsmtWatchdog watchdog, MsmtHeader requestHeader, ReadOnlyMemory<byte> payload, bool isFirstMessage, CancellationToken cancellation)
     {
         if (!options.SupportsSessionMode)
         {
-            await Respond(stream, requestHeader, MsmtMessageFlags.SessionModeUnsupported, ReadOnlyMemory<byte>.Empty, cancellation);
+            await Respond(stream, watchdog, requestHeader, MsmtMessageFlags.SessionModeUnsupported, ReadOnlyMemory<byte>.Empty, cancellation);
             return (null, true);
         }
 
         // Per the ICD, Session Mode Negotiation is only honored as the very first message on the connection.
         if (!isFirstMessage)
         {
-            await Respond(stream, requestHeader, MsmtMessageFlags.SessionModeRejected, ReadOnlyMemory<byte>.Empty, cancellation);
+            await Respond(stream, watchdog, requestHeader, MsmtMessageFlags.SessionModeRejected, ReadOnlyMemory<byte>.Empty, cancellation);
             return (null, false);
         }
 
@@ -455,14 +528,14 @@ internal sealed class MsmtServer : IDisposable, IAsyncDisposable
 
         if (requestedSeconds <= 0)
         {
-            await Respond(stream, requestHeader, MsmtMessageFlags.SessionModeUnsupported, ReadOnlyMemory<byte>.Empty, cancellation);
+            await Respond(stream, watchdog, requestHeader, MsmtMessageFlags.SessionModeUnsupported, ReadOnlyMemory<byte>.Empty, cancellation);
             return (null, true);
         }
 
         int agreedSeconds = Math.Min(requestedSeconds, (int)options.MaximumSessionLifetime.TotalSeconds);
         byte[] responsePayload = Encoding.ASCII.GetBytes(agreedSeconds.ToString(CultureInfo.InvariantCulture));
 
-        await Respond(stream, requestHeader, MsmtMessageFlags.SessionModeAccepted, responsePayload, cancellation);
+        await Respond(stream, watchdog, requestHeader, MsmtMessageFlags.SessionModeAccepted, responsePayload, cancellation);
         return (DateTime.UtcNow.AddSeconds(agreedSeconds), false);
     }
 }

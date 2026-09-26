@@ -1247,8 +1247,8 @@ public sealed class MsmtClientServerTests
             Length = (uint)negotiationPayload.Length,
         };
 
-        (MsmtHeader firstResponse, _) = await ExchangeRawAsync(stream, negotiationHeader, negotiationPayload);
-        (MsmtHeader secondResponse, _) = await ExchangeRawAsync(stream, negotiationHeader with { MessageId = MsmtProtocol.GenerateMessageId() }, negotiationPayload);
+        (MsmtHeader firstResponse, _) = await ExchangeRaw(stream, negotiationHeader, negotiationPayload);
+        (MsmtHeader secondResponse, _) = await ExchangeRaw(stream, negotiationHeader with { MessageId = MsmtProtocol.GenerateMessageId() }, negotiationPayload);
 
         protocol.Close();
 
@@ -1301,9 +1301,9 @@ public sealed class MsmtClientServerTests
             Length = (uint)negotiationPayload.Length,
         };
 
-        (MsmtHeader firstResponse, _) = await ExchangeRawAsync(stream, plainHeader, []);
-        (MsmtHeader secondResponse, _) = await ExchangeRawAsync(stream, negotiationHeader, negotiationPayload);
-        (MsmtHeader thirdResponse, _) = await ExchangeRawAsync(stream, plainHeader with { MessageId = MsmtProtocol.GenerateMessageId() }, []);
+        (MsmtHeader firstResponse, _) = await ExchangeRaw(stream, plainHeader, []);
+        (MsmtHeader secondResponse, _) = await ExchangeRaw(stream, negotiationHeader, negotiationPayload);
+        (MsmtHeader thirdResponse, _) = await ExchangeRaw(stream, plainHeader with { MessageId = MsmtProtocol.GenerateMessageId() }, []);
 
         protocol.Close();
 
@@ -1352,7 +1352,7 @@ public sealed class MsmtClientServerTests
             Length = 0,
         };
 
-        (MsmtHeader response, _) = await ExchangeRawAsync(protocol.Stream, unacknowledgedHeader, []);
+        (MsmtHeader response, _) = await ExchangeRaw(protocol.Stream, unacknowledgedHeader, []);
 
         protocol.Close();
 
@@ -1394,7 +1394,7 @@ public sealed class MsmtClientServerTests
             Length = (uint)malformedPayload.Length,
         };
 
-        (MsmtHeader malformedResponse, _) = await ExchangeRawAsync(malformedProtocol.Stream, malformedHeader, malformedPayload);
+        (MsmtHeader malformedResponse, _) = await ExchangeRaw(malformedProtocol.Stream, malformedHeader, malformedPayload);
         malformedProtocol.Close();
 
         using TcpClient negativeTcpClient = new();
@@ -1411,7 +1411,7 @@ public sealed class MsmtClientServerTests
             Length = (uint)negativePayload.Length,
         };
 
-        (MsmtHeader negativeResponse, _) = await ExchangeRawAsync(negativeProtocol.Stream, negativeHeader, negativePayload);
+        (MsmtHeader negativeResponse, _) = await ExchangeRaw(negativeProtocol.Stream, negativeHeader, negativePayload);
         negativeProtocol.Close();
 
         Assert.Equal(MsmtMessageFlags.SessionModeUnsupported, malformedResponse.Flags);
@@ -1456,7 +1456,7 @@ public sealed class MsmtClientServerTests
             Length = 0,
         };
 
-        (MsmtHeader response, byte[] payload) = await ExchangeRawAsync(stream, requestHeader, []);
+        (MsmtHeader response, byte[] payload) = await ExchangeRaw(stream, requestHeader, []);
         protocol.Close();
 
         Assert.Equal(MsmtMessageFlags.InvalidPreambleOrModeUnsupported, response.Flags);
@@ -1502,7 +1502,7 @@ public sealed class MsmtClientServerTests
             Length = 0,
         };
 
-        (MsmtHeader response, byte[] payload) = await ExchangeRawAsync(stream, requestHeader, []);
+        (MsmtHeader response, byte[] payload) = await ExchangeRaw(stream, requestHeader, []);
         protocol.Close();
 
         Assert.Equal(MsmtMessageFlags.InvalidPreambleOrModeUnsupported, response.Flags);
@@ -1873,10 +1873,10 @@ public sealed class MsmtClientServerTests
         Assert.Throws<Org.BouncyCastle.Tls.TlsFatalAlert>(() => protocol.Connect(new MsmtTlsClient(clientOptions)));
     }
 
-    private static async Task<MsmtResponse> SendAndWaitForResponse(MsmtClient client, ReadOnlyMemory<byte> payload, MsmtSendOptions? options = null) =>
+    private async Task<MsmtResponse> SendAndWaitForResponse(MsmtClient client, ReadOnlyMemory<byte> payload, MsmtSendOptions? options = null) =>
         await client.Request(payload, options).WaitAsync(TimeSpan.FromSeconds(5));
 
-    private static async Task SendAndWaitForCompletion(MsmtClient client, ReadOnlyMemory<byte> payload, MsmtSendOptions? options = null)
+    private async Task SendAndWaitForCompletion(MsmtClient client, ReadOnlyMemory<byte> payload, MsmtSendOptions? options = null)
     {
         object tag = new();
         TaskCompletionSource completed = new();
@@ -1900,7 +1900,7 @@ public sealed class MsmtClientServerTests
         }
     }
 
-    private static async Task<MsmtUnlinkedEventArgs> SendAndWaitForDisconnection(MsmtClient client, ReadOnlyMemory<byte> payload, MsmtSendOptions? options = null)
+    private async Task<MsmtUnlinkedEventArgs> SendAndWaitForDisconnection(MsmtClient client, ReadOnlyMemory<byte> payload, MsmtSendOptions? options = null)
     {
         TaskCompletionSource<MsmtUnlinkedEventArgs> source = new();
         void Handler(object? sender, MsmtUnlinkedEventArgs args) => source.TrySetResult(args);
@@ -1917,7 +1917,7 @@ public sealed class MsmtClientServerTests
         }
     }
 
-    private static async Task<MsmtLinkFailedEventArgs> SendAndWaitForConnectionFailure(MsmtClient client, ReadOnlyMemory<byte> payload, MsmtSendOptions? options = null)
+    private async Task<MsmtLinkFailedEventArgs> SendAndWaitForConnectionFailure(MsmtClient client, ReadOnlyMemory<byte> payload, MsmtSendOptions? options = null)
     {
         TaskCompletionSource<MsmtLinkFailedEventArgs> source = new();
         void Handler(object? sender, MsmtLinkFailedEventArgs args) => source.TrySetResult(args);
@@ -1997,7 +1997,7 @@ public sealed class MsmtClientServerTests
         }
     }
 
-    private static async Task<(MsmtHeader Header, byte[] Payload)> ExchangeRawAsync(Stream stream, MsmtHeader header, byte[] payload)
+    private async Task<(MsmtHeader Header, byte[] Payload)> ExchangeRaw(Stream stream, MsmtHeader header, byte[] payload)
     {
         byte[] headerBuffer = new byte[MsmtHeader.Size];
         header.Write(headerBuffer);

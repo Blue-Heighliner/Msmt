@@ -1,13 +1,15 @@
 namespace BlueHeighliner.Msmt.Internal;
 
 /// <summary>
-/// A tagged payload queued on a single <see cref="MsmtClient"/>, backing <see cref="IMsmtPeer.Packages"/>
-/// and <see cref="IMsmtPeer.GetPackage"/>.
+/// A tagged payload tracked by an <see cref="IMsmtPackageTracker"/>, backing <see
+/// cref="IMsmtPeer.Packages"/> and <see cref="IMsmtPeer.GetPackage"/>. Independent of the pooled <see
+/// cref="MsmtClient"/> that carried it, so it keeps working after that client has been evicted.
 /// </summary>
-/// <param name="client">The client the tagged payload was queued on.</param>
+/// <param name="tracker">The tracker the tagged payload is registered with.</param>
 /// <param name="tag">The tag identifying the payload.</param>
+/// <param name="target">The remote peer the payload was sent to.</param>
 /// <param name="initialStatus">The tag's status as of construction.</param>
-internal sealed class MsmtPackage(MsmtClient client, object tag, MsmtSendStatus initialStatus) : IMsmtPackage
+internal sealed class MsmtPackage(IMsmtPackageTracker tracker, object tag, MsmtNameTarget target, MsmtSendStatus initialStatus) : IMsmtPackage
 {
     private MsmtSendStatus status = initialStatus;
     private bool isFinal = initialStatus is MsmtSendStatus.Completed or MsmtSendStatus.Cancelled;
@@ -16,7 +18,7 @@ internal sealed class MsmtPackage(MsmtClient client, object tag, MsmtSendStatus 
     public object Tag { get; } = tag;
 
     /// <inheritdoc />
-    public MsmtNameTarget Target => client.Target;
+    public MsmtNameTarget Target { get; } = target;
 
     /// <inheritdoc />
     public MsmtSendStatus Status
@@ -25,7 +27,7 @@ internal sealed class MsmtPackage(MsmtClient client, object tag, MsmtSendStatus 
         {
             if (!isFinal)
             {
-                status = client.GetStatus(Tag) ?? status;
+                status = tracker.GetStatus(Tag) ?? status;
                 isFinal = status is MsmtSendStatus.Completed or MsmtSendStatus.Cancelled;
             }
 
@@ -34,5 +36,5 @@ internal sealed class MsmtPackage(MsmtClient client, object tag, MsmtSendStatus 
     }
 
     /// <inheritdoc />
-    public void Cancel() => client.Cancel(Tag);
+    public void Cancel() => tracker.Cancel(Tag);
 }

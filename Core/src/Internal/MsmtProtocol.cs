@@ -79,21 +79,46 @@ internal static class MsmtProtocol
     /// <exception cref="IOException">The remote peer closed the connection before <paramref name="length"/> bytes were received.</exception>
     public static async Task<IMemoryOwner<byte>> ReadPooled(Stream stream, int length, CancellationToken cancellation)
     {
-        IMemoryOwner<byte> owner = new SlicedMemoryOwner(MemoryPool<byte>.Shared.Rent(length), length);
-        await ReadExact(stream, owner.Memory, cancellation);
-        return owner;
+        IMemoryOwner<byte> owner = MemoryPool<byte>.Shared.Rent(length).Slice(0, length);
+
+        try
+        {
+            await ReadExact(stream, owner.Memory, cancellation);
+            return owner;
+        }
+        catch
+        {
+            owner.Dispose();
+            throw;
+        }
     }
 
     /// <summary>
-    /// Copies <paramref name="source"/> into a new buffer rented from <see cref="MemoryPool{T}.Shared"/>.
+    /// Enables TCP keep-alive on <paramref name="socket"/> so the operating system detects a peer or network
+    /// path that vanished without closing the connection. Best-effort: a platform that rejects any of the
+    /// options leaves the connection unaffected.
     /// </summary>
-    /// <param name="source">The data to copy.</param>
-    /// <returns>An owner of the rented buffer, containing a copy of <paramref name="source"/>.</returns>
-    public static IMemoryOwner<byte> ClonePooled(ReadOnlyMemory<byte> source)
+    /// <param name="socket">The connected socket.</param>
+    /// <param name="time">How long the connection may be silent before probing starts, or <see langword="null"/> to do nothing.</param>
+    public static void ApplyTcpKeepAlive(Socket socket, TimeSpan? time)
     {
-        IMemoryOwner<byte> owner = new SlicedMemoryOwner(MemoryPool<byte>.Shared.Rent(source.Length), source.Length);
-        source.CopyTo(owner.Memory);
-        return owner;
+        if (time is not { } keepAliveTime)
+        {
+            return;
+        }
+
+        int seconds = (int)Math.Clamp(Math.Ceiling(keepAliveTime.TotalSeconds), 1, int.MaxValue);
+
+        try
+        {
+            socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
+            socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, seconds);
+            socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveInterval, Math.Min(seconds, 10));
+            socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveRetryCount, 3);
+        }
+        catch (Exception exception) when (exception is SocketException or PlatformNotSupportedException or ObjectDisposedException)
+        {
+        }
     }
 
     /// <summary>

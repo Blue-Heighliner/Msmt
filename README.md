@@ -5,7 +5,7 @@
 [![Build](https://github.com/Blue-Heighliner/Msmt/actions/workflows/build.yml/badge.svg)](https://github.com/Blue-Heighliner/Msmt/actions/workflows/build.yml)
 [![Coverage](https://raw.githubusercontent.com/Blue-Heighliner/Msmt/main/.github/badges/badge_linecoverage.svg)](https://github.com/Blue-Heighliner/Msmt/actions/workflows/build.yml)
 
-A C# implementation of the Mercury Secure Message Transport (MSMT) standard — an open,
+A C# implementation of the Mercury Secure Message Transport (MSMT) standard - an open,
 standards-based interface for secure message transport over IP networks, defined by MITRE's
 *Mercury Secure Message Transport Interface Control Document (ICD)*. MSMT is a fixed, narrowly
 pinned configuration of TLS 1.3 paired with a thin, standardized message-framing API; this library
@@ -28,13 +28,8 @@ MsmtCredentials credentials = MsmtCredentials.FromPemFiles("identity.pem", "iden
 // address rather than a real DNS hostname; leave it enabled (the default) whenever a hostname is used.
 IMsmtPeer peer = new MsmtPeerFactory().Create(new MsmtOptions { Credentials = credentials, RequireFullyQualifiedHostname = false });
 
-peer.Received.Subscribe(args =>
-{
-    using (args.Payload)
-    {
-        Console.WriteLine(Encoding.UTF8.GetString(args.Payload.Memory.Span));
-    }
-});
+// The peer disposes args.Payload once every subscriber has run; copy anything needed beyond that.
+peer.Received.Subscribe(args => Console.WriteLine(Encoding.UTF8.GetString(args.Payload.Memory.Span)));
 
 peer.StartListener(port: 5000);
 peer.Send(new MsmtTarget { Host = "127.0.0.1", Port = 5000 }, "hello"u8.ToArray());

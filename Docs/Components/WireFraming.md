@@ -15,10 +15,10 @@ its request by version and message ID. `MsmtMessageFlags` is a `[Flags]` enum wh
 higher-level outcomes - e.g. `SessionModeAccepted` is `SessionModeNegotiation | MessageSuccess`.
 
 `MsmtProtocol.ReadPooled` reads a payload directly into a buffer rented from `MemoryPool<byte>.Shared`
-(sliced to the exact requested length via `SlicedMemoryOwner`, since a pool may return a larger buffer than
+(sliced to the exact requested length via the public `Slice` extension, since a pool may return a larger buffer than
 requested), so a received message never costs an extra allocation beyond the pool's own; `ReadExact` is the
 underlying loop-until-filled primitive both `ReadPooled` and raw header reads use.
 
-`MsmtProtocol` also exposes `MaxTimerDuration`/`ClampToMaxTimerDuration`, used by both `MsmtClient` and
-`MsmtServerConnection` to chain arbitrarily long idle-timeout waits around `Task.Delay`'s roughly 49.7-day
+`MsmtProtocol` also exposes `MaxTimerDuration`/`ClampToMaxTimerDuration`, used by `MsmtWatchdog` and
+`MsmtServer` to keep arbitrarily long timeouts and session lifetimes within `Task.Delay`'s roughly 49.7-day
 ceiling.

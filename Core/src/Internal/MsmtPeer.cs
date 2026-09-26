@@ -2,19 +2,37 @@ namespace BlueHeighliner.Msmt.Internal;
 
 /// <inheritdoc cref="IMsmtPeer" />
 /// <remarks>
-/// Idle timeout and connection count limits (see <see cref="MsmtOptions.MaxIdleTime"/> and <see
+/// Idle time and connection count limits (see <see cref="MsmtOptions.MaxIdleTime"/> and <see
 /// cref="MsmtOptions.MaxConnectionCount"/>) apply symmetrically to both the outgoing links this peer
 /// creates on demand in <see cref="Send"/> and the incoming links its internal <see cref="MsmtServer"/>
 /// receiver accepts, counted independently per direction, and never interrupt a link with a
-/// send/message cycle currently in progress.
+/// send/message cycle currently in progress. Both are enforced here, by one sweep over the pool, rather
+/// than by each connection. Tagged sends are tracked by the peer itself, not by the pooled client that
+/// carried them, so their packages outlive that client's eviction.
 /// </remarks>
 internal sealed class MsmtPeer : IMsmtPeer
 {
+    /// <summary>
+    /// Creates a peer, immediately starting its background on-demand connection eviction loop. Call <see
+    /// cref="StartListener"/> separately to also start listening.
+    /// </summary>
+    /// <param name="options">Shared credentials and connection-behavior defaults for this peer.</param>
+    /// <exception cref="ArgumentOutOfRangeException">A timeout or interval in <paramref name="options"/> is not positive, or <see cref="MsmtOptions.KeepAliveMinInterval"/> exceeds <see cref="MsmtOptions.KeepAliveMaxInterval"/>.</exception>
+    public MsmtPeer(MsmtOptions options)
+    {
+        ValidateOptions(options);
+        this.options = options;
+        CancellationToken cancellation = disposalCancellation.Token;
+        evictionLoop = Task.Run(() => EvictionLoop(cancellation));
+    }
+
     private readonly MsmtOptions options;
     private readonly ConcurrentDictionary<(string Host, int Port), MsmtConnection> connections = new();
     private readonly ConcurrentDictionary<IMsmtConnection, byte> activeConnections = new();
+    private readonly IMsmtPackageTracker packageTracker = new MsmtPackageTracker();
     private readonly CancellationTokenSource disposalCancellation = new();
     private readonly TimeSpan evictionCheckInterval = TimeSpan.FromSeconds(1);
+    private readonly int maxDroppedSenderRetries = 2;
     private readonly Task evictionLoop;
     private readonly MsmtEventSubject<MsmtLinkingEventArgs> linking = new();
     private readonly MsmtEventSubject<MsmtLinkedEventArgs> linked = new();
@@ -26,17 +44,7 @@ internal sealed class MsmtPeer : IMsmtPeer
     private readonly MsmtEventSubject<MsmtDisconnectedEventArgs> disconnected = new();
 
     private MsmtServer? server;
-
-    /// <summary>
-    /// Creates a peer, immediately starting its background on-demand connection eviction loop. Call <see
-    /// cref="StartListener"/> separately to also start listening.
-    /// </summary>
-    /// <param name="options">Shared credentials and connection-behavior defaults for this peer.</param>
-    public MsmtPeer(MsmtOptions options)
-    {
-        this.options = options;
-        evictionLoop = Task.Run(EvictionLoop);
-    }
+    private int disposed;
 
     /// <inheritdoc />
     public IObservable<MsmtLinkingEventArgs> Linking => linking;
@@ -72,13 +80,18 @@ internal sealed class MsmtPeer : IMsmtPeer
     public IReadOnlyList<IMsmtConnection> ActiveConnections => [.. activeConnections.Keys];
 
     /// <inheritdoc />
-    public IReadOnlyList<IMsmtPackage> Packages =>
-        [.. connections.Values.Where(connection => connection.SenderEngine is not null).SelectMany(connection => connection.SenderEngine!.Packages)];
+    public IReadOnlyList<IMsmtPackage> Packages => packageTracker.GetActivePackages();
+
+    /// <summary>Gets how many outgoing connections are currently pooled, whether or not each has an open link. Exposed for diagnostics and testing.</summary>
+    internal int SenderCount => EnumerateSenders().Count();
+
+    private bool IsDisposed => Volatile.Read(ref disposed) != 0;
 
     /// <inheritdoc />
     public void StartListener(int port = 0, string host = "0.0.0.0")
     {
-        server?.Dispose();
+        ObjectDisposedException.ThrowIf(IsDisposed, this);
+        StopListener();
 
         MsmtServer newServer = new();
         newServer.Linking += (_, args) =>
@@ -99,16 +112,29 @@ internal sealed class MsmtPeer : IMsmtPeer
             RaiseUnlinked(args);
         };
         newServer.PackageChanged += (_, args) => packageChanged.Publish(args);
-        newServer.Host(new MsmtHostOptions
+
+        try
         {
-            Host = host,
-            Port = port,
-            Credentials = options.Credentials,
-            SupportsSessionMode = options.SupportsSessionMode,
-            MaximumSessionLifetime = options.MaximumSessionLifetime,
-            RequireFullyQualifiedHostname = options.RequireFullyQualifiedHostname,
-            MaxIdleTime = options.MaxIdleTime,
-        });
+            newServer.Host(new MsmtHostOptions
+            {
+                Host = host,
+                Port = port,
+                Credentials = options.Credentials,
+                SupportsSessionMode = options.SupportsSessionMode,
+                MaximumSessionLifetime = options.MaximumSessionLifetime,
+                RequireFullyQualifiedHostname = options.RequireFullyQualifiedHostname,
+                RekeyLimit = options.RekeyLimit,
+                HandshakeTimeout = options.HandshakeTimeout,
+                StallTimeout = options.StallTimeout,
+                TcpKeepAliveTime = options.TcpKeepAliveTime,
+            });
+        }
+        catch
+        {
+            newServer.Dispose();
+            throw;
+        }
+
         server = newServer;
     }
 
@@ -122,26 +148,64 @@ internal sealed class MsmtPeer : IMsmtPeer
     /// <inheritdoc />
     public void Send(MsmtNameTarget target, IMemoryOwner<byte> payload, MsmtSendOptions? options = null)
     {
-        // Validated before GetOrCreateConnection so an oversized payload never opens a connection it can't use.
+        ObjectDisposedException.ThrowIf(IsDisposed, this);
+
+        // Validated before ReserveSender so an oversized payload never opens a connection it can't use.
         MsmtProtocol.ValidatePayloadLength(payload.Memory.Length, nameof(payload));
-        MsmtConnection connection = GetOrCreateConnection(target);
-        connection.SenderEngine!.Send(payload, options);
+
+        for (int attempt = 0; ; attempt++)
+        {
+            MsmtClient sender = ReserveSender(target);
+
+            try
+            {
+                sender.Send(payload, options);
+                return;
+            }
+            catch (ObjectDisposedException) when (attempt < maxDroppedSenderRetries && !IsDisposed)
+            {
+                // The caller dropped or disconnected this connection between reserving it and queuing on
+                // it. It has already left the pool, so a retry gets a fresh one; the payload was not taken.
+            }
+            finally
+            {
+                sender.ReleaseReservation();
+            }
+        }
     }
 
     /// <inheritdoc />
     public async Task<MsmtResponse> Request(MsmtNameTarget target, IMemoryOwner<byte> payload, MsmtSendOptions? options = null, CancellationToken cancellation = default)
     {
+        ObjectDisposedException.ThrowIf(IsDisposed, this);
         MsmtProtocol.ValidatePayloadLength(payload.Memory.Length, nameof(payload));
-        MsmtConnection connection = GetOrCreateConnection(target);
-        return await connection.SenderEngine!.Request(payload, options, cancellation);
+
+        Task<MsmtResponse> response;
+
+        for (int attempt = 0; ; attempt++)
+        {
+            MsmtClient sender = ReserveSender(target);
+
+            try
+            {
+                response = sender.Request(payload, options, cancellation);
+                break;
+            }
+            catch (ObjectDisposedException) when (attempt < maxDroppedSenderRetries && !IsDisposed)
+            {
+                // See Send: the dropped connection has left the pool, and the payload was not taken.
+            }
+            finally
+            {
+                sender.ReleaseReservation();
+            }
+        }
+
+        return await response;
     }
 
     /// <inheritdoc />
-    public IMsmtPackage? GetPackage(object tag) =>
-        connections.Values
-            .Where(connection => connection.SenderEngine is not null)
-            .Select(connection => connection.SenderEngine!.GetPackage(tag))
-            .FirstOrDefault(package => package is not null);
+    public IMsmtPackage? GetPackage(object tag) => packageTracker.GetPackage(tag);
 
     /// <inheritdoc />
     public IMsmtConnection? GetActiveConnection(MsmtTarget target)
@@ -157,58 +221,49 @@ internal sealed class MsmtPeer : IMsmtPeer
     /// <inheritdoc />
     public async Task<bool> Test(MsmtNameTarget target, CancellationToken cancellation = default)
     {
+        ObjectDisposedException.ThrowIf(IsDisposed, this);
         using TcpClient tcpClient = new();
-        await tcpClient.ConnectAsync(target.Host, target.Port, cancellation);
+        using MsmtWatchdog watchdog = new(tcpClient.Close);
 
-        MsmtConnectOptions connectOptions = new()
-        {
-            Target = target,
-            Credentials = options.Credentials,
-        };
-
-        TlsClientProtocol protocol = new(tcpClient.GetStream());
-        protocol.Connect(new MsmtTlsClient(connectOptions));
+        // Neither BouncyCastle's blocking handshake nor its TLS stream honors a cancellation token once
+        // blocked, so closing the socket is the only way cancellation can take effect promptly.
+        using CancellationTokenRegistration closeOnCancellation = cancellation.Register(tcpClient.Close);
 
         try
         {
-            Stream stream = protocol.Stream;
-
-            MsmtHeader requestHeader = new()
+            TlsClientProtocol protocol;
+            using (watchdog.Guard(options.HandshakeTimeout, false))
             {
-                Version = MsmtHeader.SupportedVersion,
-                Flags = MsmtMessageFlags.ReachabilityCheck,
-                MessageId = MsmtProtocol.GenerateMessageId(),
-                Length = 0,
-            };
+                await tcpClient.ConnectAsync(target.Host, target.Port, cancellation);
+                MsmtProtocol.ApplyTcpKeepAlive(tcpClient.Client, options.TcpKeepAliveTime);
 
-            byte[] headerBuffer = new byte[MsmtHeader.Size];
-            requestHeader.Write(headerBuffer);
-            await stream.WriteAsync(headerBuffer, cancellation);
-
-            await MsmtProtocol.ReadExact(stream, headerBuffer, cancellation);
-            MsmtHeader responseHeader = MsmtHeader.Read(headerBuffer);
-
-            if (!responseHeader.IsWellFormed())
-            {
-                return false;
+                protocol = new(new MsmtWatchedStream(tcpClient.GetStream(), watchdog));
+                MsmtTlsClient tlsClient = new(new MsmtConnectOptions { Target = target, Credentials = options.Credentials });
+                await Task.Run(() => protocol.Connect(tlsClient), cancellation);
             }
 
-            if (responseHeader.Length > 0)
-            {
-                await MsmtProtocol.ReadExact(stream, new byte[responseHeader.Length], cancellation);
-            }
-
-            return responseHeader.Acknowledges(requestHeader) && (responseHeader.Flags & MsmtMessageFlags.ReachabilityCheck) == MsmtMessageFlags.ReachabilityCheck;
-        }
-        finally
-        {
             try
             {
-                protocol.Close();
+                return await ExchangeReachabilityCheck(protocol.Stream, watchdog, cancellation);
             }
-            catch (IOException)
+            finally
             {
+                try
+                {
+                    protocol.Close();
+                }
+                catch (Exception exception) when (exception is IOException or ObjectDisposedException)
+                {
+                }
             }
+        }
+        catch (Exception exception) when (exception is not (OperationCanceledException or TimeoutException) && cancellation.IsCancellationRequested)
+        {
+            throw new OperationCanceledException("The reachability test was cancelled.", exception, cancellation);
+        }
+        catch (Exception exception) when (exception is not (OperationCanceledException or TimeoutException) && watchdog.HasExpired)
+        {
+            throw new TimeoutException("The remote peer did not respond within the configured timeout.", exception);
         }
     }
 
@@ -220,12 +275,17 @@ internal sealed class MsmtPeer : IMsmtPeer
     /// </summary>
     public void Dispose()
     {
-        disposalCancellation.Cancel();
-        server?.Dispose();
-
-        foreach (MsmtConnection connection in connections.Values)
+        if (Interlocked.Exchange(ref disposed, 1) != 0)
         {
-            connection.SenderEngine?.Dispose();
+            return;
+        }
+
+        disposalCancellation.Cancel();
+        StopListener();
+
+        foreach (MsmtClient sender in EnumerateSenders())
+        {
+            sender.Dispose();
         }
 
         disposalCancellation.Dispose();
@@ -239,6 +299,11 @@ internal sealed class MsmtPeer : IMsmtPeer
     /// <returns>A task that completes once the shutdown has finished.</returns>
     public async ValueTask DisposeAsync()
     {
+        if (Interlocked.Exchange(ref disposed, 1) != 0)
+        {
+            return;
+        }
+
         await disposalCancellation.CancelAsync();
 
         try
@@ -252,20 +317,87 @@ internal sealed class MsmtPeer : IMsmtPeer
         // Closed before the server: a still-open link's read loop on the other side may only unblock once
         // this side closes it, so closing our own on-demand links first avoids this peer outliving links it
         // could have released earlier.
-        foreach (MsmtConnection connection in connections.Values)
+        foreach (MsmtClient sender in EnumerateSenders())
         {
-            if (connection.SenderEngine is not null)
-            {
-                await connection.SenderEngine.DisposeAsync();
-            }
+            await sender.DisposeAsync();
         }
 
         if (server is not null)
         {
             await server.DisposeAsync();
+            server = null;
         }
 
         disposalCancellation.Dispose();
+    }
+
+    private void ValidateOptions(MsmtOptions candidate)
+    {
+        foreach ((string name, TimeSpan? value) in new (string, TimeSpan?)[]
+        {
+            (nameof(MsmtOptions.MaxIdleTime), candidate.MaxIdleTime),
+            (nameof(MsmtOptions.HandshakeTimeout), candidate.HandshakeTimeout),
+            (nameof(MsmtOptions.StallTimeout), candidate.StallTimeout),
+            (nameof(MsmtOptions.ResponseTimeout), candidate.ResponseTimeout),
+            (nameof(MsmtOptions.TcpKeepAliveTime), candidate.TcpKeepAliveTime),
+            (nameof(MsmtOptions.KeepAliveMinInterval), candidate.KeepAliveMinInterval),
+            (nameof(MsmtOptions.KeepAliveMaxInterval), candidate.KeepAliveMaxInterval),
+        })
+        {
+            if (value <= TimeSpan.Zero)
+            {
+                throw new ArgumentOutOfRangeException(nameof(candidate), value, $"{name} must be positive, or null where it can be disabled.");
+            }
+        }
+
+        if (candidate.KeepAliveMinInterval > candidate.KeepAliveMaxInterval)
+        {
+            throw new ArgumentOutOfRangeException(nameof(candidate), candidate.KeepAliveMinInterval, "KeepAliveMinInterval must not exceed KeepAliveMaxInterval.");
+        }
+    }
+
+    private IEnumerable<MsmtClient> EnumerateSenders() =>
+        connections.Values.Select(connection => connection.SenderEngine).OfType<MsmtClient>();
+
+    private async Task<bool> ExchangeReachabilityCheck(Stream stream, MsmtWatchdog watchdog, CancellationToken cancellation)
+    {
+        MsmtHeader requestHeader = new()
+        {
+            Version = MsmtHeader.SupportedVersion,
+            Flags = MsmtMessageFlags.ReachabilityCheck,
+            MessageId = MsmtProtocol.GenerateMessageId(),
+            Length = 0,
+        };
+
+        byte[] headerBuffer = new byte[MsmtHeader.Size];
+        requestHeader.Write(headerBuffer);
+
+        using (watchdog.Guard(options.StallTimeout, true))
+        {
+            await stream.WriteAsync(headerBuffer, cancellation);
+        }
+
+        MsmtHeader responseHeader;
+        using (watchdog.Guard(options.ResponseTimeout, false))
+        {
+            await MsmtProtocol.ReadExact(stream, headerBuffer, cancellation);
+            responseHeader = MsmtHeader.Read(headerBuffer);
+        }
+
+        if (!responseHeader.IsWellFormed())
+        {
+            return false;
+        }
+
+        if (responseHeader.Length > 0)
+        {
+            using (watchdog.Guard(options.StallTimeout, true))
+            {
+                await MsmtProtocol.ReadExact(stream, new byte[responseHeader.Length], cancellation);
+            }
+        }
+
+        return responseHeader.Acknowledges(requestHeader) && (responseHeader.Flags & MsmtMessageFlags.ReachabilityCheck) == MsmtMessageFlags.ReachabilityCheck;
     }
 
     private void RaiseLinked(MsmtLinkedEventArgs args)
@@ -308,8 +440,13 @@ internal sealed class MsmtPeer : IMsmtPeer
 
     private void AttachIncomingLink(MsmtServerConnection link)
     {
-        MsmtConnection connection = connections.GetOrAdd((link.Target.Host, link.Target.Port), _ => new MsmtConnection(link.Target));
-        connection.AttachReceiver(link);
+        (string Host, int Port) key = (link.Target.Host, link.Target.Port);
+        MsmtConnection connection = connections.GetOrAdd(key, _ => new MsmtConnection(link.Target));
+
+        while (!connection.TryAttachReceiver(link))
+        {
+            connection = ReplaceRetiredConnection(key, connection);
+        }
     }
 
     private void DetachIncomingLink(MsmtServerConnection link)
@@ -322,20 +459,51 @@ internal sealed class MsmtPeer : IMsmtPeer
         }
     }
 
-    private MsmtConnection GetOrCreateConnection(MsmtNameTarget target)
+    /// <summary>
+    /// Gets or creates <paramref name="target"/>'s outgoing engine, reserved (see <see
+    /// cref="MsmtClient.Reserve"/>) so the caller must release it once its send is queued.
+    /// </summary>
+    /// <param name="target">The remote peer to send to.</param>
+    /// <returns>The reserved engine.</returns>
+    /// <exception cref="ObjectDisposedException">This peer was disposed concurrently.</exception>
+    private MsmtClient ReserveSender(MsmtNameTarget target)
     {
-        MsmtTarget plainTarget = new() { Host = target.Host, Port = target.Port };
-        MsmtConnection connection = connections.GetOrAdd((target.Host, target.Port), _ => new MsmtConnection(plainTarget));
-        connection.EnsureSender(() => CreateSender(connection, (target.Host, target.Port), target));
-        return connection;
+        (string Host, int Port) key = (target.Host, target.Port);
+        MsmtConnection connection = connections.GetOrAdd(key, _ => new MsmtConnection(new MsmtTarget { Host = target.Host, Port = target.Port }));
+        MsmtClient? sender;
+
+        while ((sender = connection.ReserveSender(() => CreateSender(connection, key, target))) is null)
+        {
+            connection = ReplaceRetiredConnection(key, connection);
+        }
+
+        // A sender created after disposal swept every connection would otherwise never be disposed.
+        if (IsDisposed)
+        {
+            sender.ReleaseReservation();
+            sender.Dispose();
+            throw new ObjectDisposedException(GetType().FullName);
+        }
+
+        return sender;
+    }
+
+    /// <summary>Removes <paramref name="retired"/> from the registry, if still there, and gets or creates its replacement.</summary>
+    /// <param name="key">The registry key <paramref name="retired"/> was found under.</param>
+    /// <param name="retired">A connection that refused an attach because it was retired concurrently.</param>
+    /// <returns>The connection now registered under <paramref name="key"/>.</returns>
+    private MsmtConnection ReplaceRetiredConnection((string Host, int Port) key, MsmtConnection retired)
+    {
+        connections.TryRemove(KeyValuePair.Create(key, retired));
+        return connections.GetOrAdd(key, _ => new MsmtConnection(retired.Target));
     }
 
     private MsmtClient CreateSender(MsmtConnection connection, (string Host, int Port) key, MsmtNameTarget target)
     {
-        MsmtClient client = new();
+        MsmtClient client = new(packageTracker);
 
         // Built and only started below: ConcurrentDictionary offers no way to run a side-effecting factory
-        // exactly once, so this factory only ever runs under MsmtConnection.EnsureSender's own lock,
+        // exactly once, so this factory only ever runs under MsmtConnection.ReserveSender's own lock,
         // guaranteeing the client's background loops are started exactly once per connection.
         client.AttachToCache(() => EvictSender(key, connection, client));
         client.Linking += (_, args) => linking.Publish(args);
@@ -351,7 +519,12 @@ internal sealed class MsmtPeer : IMsmtPeer
             Mode = options.Mode,
             SessionLifetime = options.SessionLifetime,
             RekeyLimit = options.RekeyLimit,
-            MaxIdleTime = options.MaxIdleTime,
+            HandshakeTimeout = options.HandshakeTimeout,
+            StallTimeout = options.StallTimeout,
+            ResponseTimeout = options.ResponseTimeout,
+            TcpKeepAliveTime = options.TcpKeepAliveTime,
+            KeepAliveMinInterval = options.KeepAliveMinInterval,
+            KeepAliveMaxInterval = options.KeepAliveMaxInterval,
         });
 
         return client;
@@ -365,33 +538,79 @@ internal sealed class MsmtPeer : IMsmtPeer
 
     private void RemoveConnectionIfEmpty((string Host, int Port) key, MsmtConnection connection)
     {
-        if (connection.IsEmpty)
+        // Matched by instance, not just key, so a newer connection registered under the same key is never removed.
+        if (connection.TryRetire())
         {
-            connections.TryRemove(key, out _);
+            connections.TryRemove(KeyValuePair.Create(key, connection));
         }
     }
 
-    private async Task EvictionLoop()
+    private async Task EvictionLoop(CancellationToken cancellation)
     {
         using PeriodicTimer timer = new(evictionCheckInterval);
-        while (await timer.WaitForNextTickAsync(disposalCancellation.Token))
+        while (await timer.WaitForNextTickAsync(cancellation))
         {
-            // MaxIdleTime is enforced per-connection instead (see MsmtClient/MsmtServer), so this loop is
-            // only responsible for MaxConnectionCount, counted separately for each direction.
-            if (options.MaxConnectionCount is { } maxConnectionCount)
+            try
             {
-                await EvictExcessSenders(maxConnectionCount);
-                await EvictExcessReceivers(maxConnectionCount);
+                await Sweep();
+            }
+            catch (Exception exception) when (exception is not OperationCanceledException)
+            {
+                // A failure evicting one connection must not end eviction for the life of the peer.
+            }
+        }
+    }
+
+    private async Task Sweep()
+    {
+        packageTracker.RemoveExpired();
+
+        if (options.MaxIdleTime is { } maxIdleTime)
+        {
+            await EvictUnusedSenders(maxIdleTime);
+            await EvictUnusedReceivers(maxIdleTime);
+        }
+
+        if (options.MaxConnectionCount is { } maxConnectionCount)
+        {
+            await EvictExcessSenders(maxConnectionCount);
+            await EvictExcessReceivers(maxConnectionCount);
+        }
+    }
+
+    private async Task EvictUnusedSenders(TimeSpan maxIdleTime)
+    {
+        foreach (KeyValuePair<(string Host, int Port), MsmtConnection> entry in connections)
+        {
+            if (entry.Value.SenderEngine is { IsIdle: true } sender && DateTime.UtcNow - sender.LastActivityUtc >= maxIdleTime)
+            {
+                await EvictIdleSender(entry.Key, maxIdleTime);
+            }
+        }
+    }
+
+    private async Task EvictUnusedReceivers(TimeSpan maxIdleTime)
+    {
+        foreach (MsmtServerConnection receiver in connections.Values.Select(connection => connection.ReceiverEngine).OfType<MsmtServerConnection>())
+        {
+            if (receiver.IsIdle && DateTime.UtcNow - receiver.LastActivityUtc >= maxIdleTime)
+            {
+                await receiver.Evict(new TimeoutException($"The connection had no application traffic for {maxIdleTime}."));
             }
         }
     }
 
     private async Task EvictExcessSenders(int maxConnectionCount)
     {
-        List<KeyValuePair<(string Host, int Port), MsmtConnection>> withSenders =
-            [.. connections.Where(entry => entry.Value.SenderEngine is not null)];
+        List<((string Host, int Port) Key, MsmtClient Sender)> senders =
+        [
+            .. connections
+                .Select(entry => (entry.Key, Sender: entry.Value.SenderEngine))
+                .Where(entry => entry.Sender is not null)
+                .Select(entry => (entry.Key, entry.Sender!)),
+        ];
 
-        int excess = withSenders.Count - maxConnectionCount;
+        int excess = senders.Count - maxConnectionCount;
         if (excess <= 0)
         {
             return;
@@ -400,63 +619,63 @@ internal sealed class MsmtPeer : IMsmtPeer
         // Never a busy connection - see MsmtClient.IsIdle.
         List<(string Host, int Port)> oldest =
         [
-            .. withSenders
-                .Where(entry => entry.Value.SenderEngine!.IsIdle)
-                .OrderBy(entry => entry.Value.SenderEngine!.LastActivityUtc)
+            .. senders
+                .Where(entry => entry.Sender.IsIdle)
+                .OrderBy(entry => entry.Sender.LastActivityUtc)
                 .Take(excess)
                 .Select(entry => entry.Key),
         ];
 
         foreach ((string Host, int Port) key in oldest)
         {
-            await EvictConnection(key);
+            await EvictIdleSender(key, TimeSpan.Zero);
         }
     }
 
     private async Task EvictExcessReceivers(int maxConnectionCount)
     {
-        List<KeyValuePair<(string Host, int Port), MsmtConnection>> withReceivers =
-            [.. connections.Where(entry => entry.Value.ReceiverEngine is not null)];
+        List<((string Host, int Port) Key, MsmtServerConnection Receiver)> receivers =
+        [
+            .. connections
+                .Select(entry => (entry.Key, Receiver: entry.Value.ReceiverEngine))
+                .Where(entry => entry.Receiver is not null)
+                .Select(entry => (entry.Key, entry.Receiver!)),
+        ];
 
-        int excess = withReceivers.Count - maxConnectionCount;
+        int excess = receivers.Count - maxConnectionCount;
         if (excess <= 0)
         {
             return;
         }
 
         // Never a busy connection - see MsmtServerConnection.IsIdle.
-        List<(string Host, int Port)> oldest =
+        List<MsmtServerConnection> oldest =
         [
-            .. withReceivers
-                .Where(entry => entry.Value.ReceiverEngine!.IsIdle)
-                .OrderBy(entry => entry.Value.ReceiverEngine!.LastActivityUtc)
+            .. receivers
+                .Where(entry => entry.Receiver.IsIdle)
+                .OrderBy(entry => entry.Receiver.LastActivityUtc)
                 .Take(excess)
-                .Select(entry => entry.Key),
+                .Select(entry => entry.Receiver),
         ];
 
-        foreach ((string Host, int Port) key in oldest)
+        foreach (MsmtServerConnection receiver in oldest)
         {
-            await EvictReceiver(key);
+            // Re-checked, since it may have started a message cycle since being selected above.
+            if (receiver.IsIdle)
+            {
+                await receiver.Evict(new TimeoutException($"The connection was evicted to stay within {maxConnectionCount} connections."));
+            }
         }
     }
 
-    private async Task EvictConnection((string Host, int Port) key)
+    private async Task EvictIdleSender((string Host, int Port) key, TimeSpan minIdleTime)
     {
-        // Re-checks IsIdle here, since it may have started a new send since being selected as a candidate above.
-        if (connections.TryGetValue(key, out MsmtConnection? connection) && connection.SenderEngine is { IsIdle: true } client)
+        // RemoveIdleSender re-checks idleness under the same lock ReserveSender holds, so a send queued
+        // since this sender was selected above, or about to be, keeps it attached.
+        if (connections.TryGetValue(key, out MsmtConnection? connection) && connection.RemoveIdleSender(minIdleTime) is { } sender)
         {
-            connection.RemoveSender(client);
             RemoveConnectionIfEmpty(key, connection);
-            await client.DisposeAsync();
-        }
-    }
-
-    private async Task EvictReceiver((string Host, int Port) key)
-    {
-        // Re-checks IsIdle here, since it may have started a message cycle since being selected as a candidate above.
-        if (connections.TryGetValue(key, out MsmtConnection? connection) && connection.ReceiverEngine is { IsIdle: true } receiver)
-        {
-            await receiver.Disconnect();
+            await sender.DisposeAsync();
         }
     }
 }

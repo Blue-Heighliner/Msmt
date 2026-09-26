@@ -10,11 +10,12 @@ always go out as a new client connection dialed to its own receiver.
 
 ## Listening
 
-`MsmtPeer.StartListener` disposes any previous `MsmtServer`, creates a new one, and wires its plain C#
-events into `MsmtPeer`'s own `MsmtEventSubject<T>` fields and into the connection registry:
+`MsmtPeer.StartListener` stops any previous listener, creates a new `MsmtServer` (disposing it again, and
+leaving the peer not listening, if binding fails), and wires its plain C# events into `MsmtPeer`'s own
+`MsmtEventSubject<T>` fields and into the connection registry:
 
 - `Linking` attaches the newly accepted `MsmtServerConnection` to (or creates) the target's
-  `MsmtConnection` via `AttachIncomingLink`/`AttachReceiver`, then republishes `Linking` - so a `Linking`
+  `MsmtConnection` via `AttachIncomingLink`/`TryAttachReceiver`, then republishes `Linking` - so a `Linking`
   subscriber already sees the connection registered. `MsmtServerConnection.IsConnected` (and so
   `IMsmtConnection.Receiver`) stays `false`/`null` until the handshake actually completes, mirroring
   `MsmtClient.IsConnected`'s symmetric meaning for the sending direction; `HandleConnection` calls
@@ -28,13 +29,18 @@ events into `MsmtPeer`'s own `MsmtEventSubject<T>` fields and into the connectio
 - `Received` is republished as-is (`PackageChanged` is never actually raised by `MsmtServer`).
 
 `Host` binds a `TcpListener` and starts a background `AcceptLoop` task. Each accepted `TcpClient` is handed
-to its own `HandleConnection` task immediately, so one client's slow TLS handshake never delays accepting
-the next; `HandleConnection` performs the TLS accept via `MsmtTlsServer`, raising `Linking` beforehand and
-`Linked`/`LinkFailed` once the handshake resolves, then loops reading one message at a time (never more
-than one in flight, per the ICD's request/acknowledge model):
+to its own `HandleConnection` task via `Task.Run`, since BouncyCastle's handshake blocks synchronously, so
+one client's slow or stalled TLS handshake never delays accepting the next. A failed accept that isn't
+caused by shutdown is retried after a short delay rather than ending the loop. `HandleConnection` registers
+the socket for shutdown before the handshake (so disposal also aborts a stalled one), performs the TLS
+accept via `MsmtTlsServer`, raising `Linking` beforehand and `Linked`/`LinkFailed` once the handshake
+resolves, then hands off to `ServeMessages`, which loops reading one message at a time (never more than
+one in flight, per the ICD's request/acknowledge model):
 
-1. Read the fixed 10-byte header. A malformed header gets an `InvalidPreambleOrModeUnsupported`
-   acknowledgement and the connection closes.
+1. Read the fixed 10-byte header: its first byte with no stall timeout, since the wait for a next message
+   is legitimate idleness (except right after the handshake, where `HandshakeTimeout` applies), then the
+   rest of it and the payload under `StallTimeout`. A malformed header gets an
+   `InvalidPreambleOrModeUnsupported` acknowledgement and the connection closes.
 2. If the `SessionModeNegotiation` flag is set, `RespondToSessionNegotiation` handles it (only honored as
    the very first message on the connection - see Connection lifecycle modes below) and the loop continues
    without touching `Received` at all.
@@ -45,37 +51,35 @@ than one in flight, per the ICD's request/acknowledge model):
    writes the acknowledgement. `IMsmtResponder.Accept`/`Reject` only work when an acknowledgement was
    actually requested; a plain `Send` always gets `MessageSuccess` set on its wire response, since there is
    no ack-based path through which the application could have rejected it.
-5. If a `Session` connection's negotiated lifetime has elapsed, the loop returns and the connection closes;
-   `Message`/`MessageWithRekeying` connections are instead left to the client side to close.
+5. If a `Session` connection's negotiated lifetime has elapsed, the loop returns and the connection closes.
+   Any other connection is closed after `MsmtHostOptions.RekeyLimit` messages, as its client closes it too.
 
 ## Connection lifecycle modes
 
 `RespondToSessionNegotiation` only honors a negotiation request as the very first message on a connection
 (per the ICD); it agrees to the lesser of the client's proposed lifetime and
-`MsmtHostOptions.MaximumSessionLifetime`, and the accepting `HandleConnection` loop closes the connection
-once that agreed lifetime elapses.
+`MsmtHostOptions.MaximumSessionLifetime`, and `ServeMessages` closes the connection once that agreed
+lifetime elapses. Only an accepted negotiation sets the expiry, so a rejected later attempt can't clear it.
+A silent client is cut off by `CloseAtSessionExpiry`, a timer started at negotiation that closes the socket
+at expiry plus a short grace period, if the connection is idle at that moment; a chain of clamped
+`Task.Delay` waits keeps an arbitrarily long lifetime exact.
 
-## Idle eviction
+## Activity and eviction
 
-`MsmtOptions.MaxIdleTime` has no practical effect in `Message` Mode, which always closes itself immediately
-after each cycle; it can affect a `MessageWithRekeying` or `Session` connection sitting open between
-messages, and never interrupts a connection with a message currently in progress.
-
-`MsmtServerConnection` tracks `LastActivityUtc`/`IsIdle` (mirrored via `MarkIdle`/`MarkBusy`) across the gap
-between message cycles. `HandleConnection` calls `MarkIdle` immediately before each "wait for the next
-header" read and `MarkBusy` immediately after one arrives, so only that gap ever counts as idle. Because
-BouncyCastle's TLS stream falls back to a blocking `byte[]`-based `ReadAsync` overload it never overrides
-(see Disposal below), a cancelled token alone cannot interrupt that blocked read; `RunIdleTimeout` instead
-loops a chain of clamped `Task.Delay` waits (`MsmtProtocol.ClampToMaxTimerDuration`) against the true
-deadline and, only once genuinely elapsed, closes the underlying socket directly - mirroring shutdown's own
-technique - forcing the blocked read to fail with an `IOException` that `HandleConnection` reports as a
-`TimeoutException` (disambiguated from an ordinary disconnect via a shared single-element flag
-`RunIdleTimeout` sets immediately before closing the socket). The loop is cancelled and awaited immediately
-once the read settles - before touching the header - closing the same race window `MsmtClient` closes via
-its queue.
+`MsmtServerConnection` tracks `IsIdle` (mirrored via `MarkIdle`/`MarkBusy`) and `LastActivityUtc`.
+`ServeMessages` calls `MarkIdle` before each wait for a next header and `MarkBusy` once a byte arrives, so
+only that gap counts as idle. `MarkActivity` runs after an application message has been acknowledged;
+reachability checks and session negotiation do not count, so a client that only sends keep-alives still
+ages. `MsmtPeer`'s eviction loop compares `LastActivityUtc` with `MaxIdleTime` and `MaxConnectionCount`, and
+calls `Evict`, which records a `TimeoutException` as the reason before closing the socket. `HandleConnection`
+reports that reason, or `null` for a deliberate normal close such as a session ending, instead of the read
+failure the close causes; a stall caught by the watchdog is reported as a `TimeoutException` too.
 
 ## Disposal
 
 `DisposeAsync` closes every accepted connection's raw socket directly (rather than relying on cancellation
-alone) because BouncyCastle's TLS stream falls back to a blocking `byte[]` `ReadAsync` overload it never
-overrides internally, which a cancelled token alone cannot interrupt.
+alone) because BouncyCastle's handshake blocks synchronously and its TLS stream falls back to a blocking
+`byte[]` `ReadAsync` overload it never overrides internally, neither of which a cancelled token can
+interrupt. Whatever ends a connection's loop - including an exception thrown by a `Received` subscriber,
+or shutdown while a responder is still deferred - is reported through `Unlinked` rather than rethrown, so
+one connection never makes disposal fail. `Dispose`/`DisposeAsync` are idempotent.

@@ -20,6 +20,9 @@ internal static class MsmtBcCryptography
     /// <summary>Gets the two TLS 1.3 cipher suites the MSMT ICD permits, in the required preference order.</summary>
     public static IReadOnlyList<int> CipherSuites { get; } = [CipherSuite.TLS_CHACHA20_POLY1305_SHA256, CipherSuite.TLS_AES_256_GCM_SHA384];
 
+    /// <summary>Gets the minimum RSA modulus size, in bits, this implementation accepts on a peer's certificate, per NIST SP 800-131A Revision 2.</summary>
+    public static int MinimumRsaKeySizeBits { get; } = 2048;
+
     /// <summary>
     /// Converts a node's own identity certificate into the certificate chain and private key types the
     /// BouncyCastle TLS engine signs and presents with.
@@ -37,9 +40,6 @@ internal static class MsmtBcCryptography
 
         return (chain, PrivateKeyFactory.CreateKey(privateKey.ExportPkcs8PrivateKey()));
     }
-
-    /// <summary>Gets the minimum RSA modulus size, in bits, this implementation accepts on a peer's certificate, per NIST SP 800-131A Revision 2.</summary>
-    public static int MinimumRsaKeySizeBits { get; } = 2048;
 
     /// <summary>
     /// Determines whether a peer's certificate chain is currently valid, chains to one of a set of

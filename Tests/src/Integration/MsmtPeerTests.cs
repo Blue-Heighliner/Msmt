@@ -1179,6 +1179,245 @@ public sealed class MsmtPeerTests
         Assert.Empty(peerB.ActiveConnections);
     }
 
-    private static async Task<MsmtResponse> SendAndWaitForResponse(IMsmtPeer peer, MsmtNameTarget target, ReadOnlyMemory<byte> payload) =>
+    /// <summary>A client that connects but never completes its TLS handshake does not stop the listener from accepting and serving other clients.</summary>
+    [Fact]
+    public async Task StartListener_ClientStalledMidHandshake_StillServesOtherClients()
+    {
+        (X509Certificate2 certificateA, X509Certificate2 certificateB, X509Certificate2Collection trustedAuthorities) = TestMsmtCertificates.Create();
+
+        await using MsmtPeer peerB = new(new MsmtOptions { Credentials = new MsmtCredentials { Identity = certificateB, TrustedAuthorities = trustedAuthorities }, RequireFullyQualifiedHostname = false });
+        await using MsmtPeer peerA = new(new MsmtOptions { Credentials = new MsmtCredentials { Identity = certificateA, TrustedAuthorities = trustedAuthorities } });
+
+        TaskCompletionSource stalledLinking = new();
+        using IDisposable subscription = peerB.Linking.Subscribe(_ => stalledLinking.TrySetResult());
+
+        peerB.StartListener(0, "127.0.0.1");
+
+        using TcpClient stalled = new();
+        await stalled.ConnectAsync(IPAddress.Loopback, peerB.Listener!.Port);
+        await stalledLinking.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        MsmtResponse response = await SendAndWaitForResponse(peerA, peerB.Listener!, "hello"u8.ToArray());
+
+        Assert.True(response.Success);
+    }
+
+    /// <summary><see cref="MsmtPeer.DisposeAsync"/> completes promptly even while an accepted client is stalled mid-handshake.</summary>
+    [Fact]
+    public async Task DisposeAsync_ClientStalledMidHandshake_CompletesPromptly()
+    {
+        (_, X509Certificate2 certificateB, X509Certificate2Collection trustedAuthorities) = TestMsmtCertificates.Create();
+
+        MsmtPeer peerB = new(new MsmtOptions { Credentials = new MsmtCredentials { Identity = certificateB, TrustedAuthorities = trustedAuthorities }, RequireFullyQualifiedHostname = false });
+
+        TaskCompletionSource stalledLinking = new();
+        peerB.Linking.Subscribe(_ => stalledLinking.TrySetResult());
+
+        peerB.StartListener(0, "127.0.0.1");
+
+        using TcpClient stalled = new();
+        await stalled.ConnectAsync(IPAddress.Loopback, peerB.Listener!.Port);
+        await stalledLinking.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        await peerB.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    /// <summary><see cref="MsmtPeer.DisposeAsync"/> completes without throwing while a received message's responder is still deferred.</summary>
+    [Fact]
+    public async Task DisposeAsync_WhileResponderDeferred_CompletesWithoutThrowing()
+    {
+        (X509Certificate2 certificateA, X509Certificate2 certificateB, X509Certificate2Collection trustedAuthorities) = TestMsmtCertificates.Create();
+
+        MsmtPeer peerB = new(new MsmtOptions { Credentials = new MsmtCredentials { Identity = certificateB, TrustedAuthorities = trustedAuthorities }, RequireFullyQualifiedHostname = false });
+        await using MsmtPeer peerA = new(new MsmtOptions { Credentials = new MsmtCredentials { Identity = certificateA, TrustedAuthorities = trustedAuthorities } });
+
+        TaskCompletionSource deferred = new();
+        peerB.Received.Subscribe(args =>
+        {
+            args.Responder.Defer();
+            deferred.TrySetResult();
+        });
+
+        peerB.StartListener(0, "127.0.0.1");
+
+        Task<MsmtResponse> response = peerA.Request(peerB.Listener!, "hello"u8.ToArray());
+        await deferred.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        await peerB.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5));
+
+        await Assert.ThrowsAnyAsync<Exception>(() => response.WaitAsync(TimeSpan.FromSeconds(5)));
+    }
+
+    /// <summary>A <see cref="IMsmtPeer.Linking"/> subscriber that throws fails just that link, reported through <see cref="IMsmtPeer.LinkFailed"/>, without breaking the listener's own shutdown.</summary>
+    [Fact]
+    public async Task Linking_SubscriberThrows_RaisesLinkFailedAndDisposesCleanly()
+    {
+        (X509Certificate2 certificateA, X509Certificate2 certificateB, X509Certificate2Collection trustedAuthorities) = TestMsmtCertificates.Create();
+
+        MsmtPeer peerB = new(new MsmtOptions { Credentials = new MsmtCredentials { Identity = certificateB, TrustedAuthorities = trustedAuthorities }, RequireFullyQualifiedHostname = false });
+        await using MsmtPeer peerA = new(new MsmtOptions { Credentials = new MsmtCredentials { Identity = certificateA, TrustedAuthorities = trustedAuthorities } });
+
+        InvalidOperationException thrown = new("subscriber failure");
+        TaskCompletionSource<MsmtLinkFailedEventArgs> linkFailed = new();
+        peerB.Linking.Subscribe(_ => throw thrown);
+        peerB.LinkFailed.Subscribe(args => linkFailed.TrySetResult(args));
+
+        peerB.StartListener(0, "127.0.0.1");
+
+        await Assert.ThrowsAnyAsync<Exception>(() => peerA.Request(peerB.Listener!, "hello"u8.ToArray()).WaitAsync(TimeSpan.FromSeconds(5)));
+        MsmtLinkFailedEventArgs failure = await linkFailed.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Same(thrown, failure.Exception);
+        await peerB.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Empty(peerB.ActiveConnections);
+    }
+
+    /// <summary>A pool-rented buffer trimmed with <see cref="MsmtMemoryOwnerExtensions.Slice"/> is delivered with exactly the sliced bytes, not the pool's larger allocation.</summary>
+    [Fact]
+    public async Task Request_SlicedRentedOwner_DeliversExactlyTheSlicedBytes()
+    {
+        (X509Certificate2 certificateA, X509Certificate2 certificateB, X509Certificate2Collection trustedAuthorities) = TestMsmtCertificates.Create();
+
+        await using MsmtPeer peerB = new(new MsmtOptions { Credentials = new MsmtCredentials { Identity = certificateB, TrustedAuthorities = trustedAuthorities }, RequireFullyQualifiedHostname = false });
+        await using MsmtPeer peerA = new(new MsmtOptions { Credentials = new MsmtCredentials { Identity = certificateA, TrustedAuthorities = trustedAuthorities } });
+
+        TaskCompletionSource<byte[]> received = new();
+        peerB.Received.Subscribe(args => received.TrySetResult(args.Payload.Memory.ToArray()));
+        peerB.StartListener(0, "127.0.0.1");
+
+        byte[] payload = "hello"u8.ToArray();
+        IMemoryOwner<byte> owner = MemoryPool<byte>.Shared.Rent(payload.Length + 100).Slice(0, payload.Length);
+        payload.CopyTo(owner.Memory);
+
+        MsmtResponse response = await peerA.Request(peerB.Listener!, owner).WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.True(response.Success);
+        Assert.Equal(payload, await received.Task.WaitAsync(TimeSpan.FromSeconds(5)));
+    }
+
+    /// <summary><see cref="MsmtPeer.Test"/> honors its cancellation token even while the remote peer never answers the TLS handshake.</summary>
+    [Fact]
+    public async Task Test_CancelledWhileRemoteNeverResponds_ThrowsOperationCanceledPromptly()
+    {
+        (X509Certificate2 certificateA, _, X509Certificate2Collection trustedAuthorities) = TestMsmtCertificates.Create();
+
+        using TcpListener silent = new(IPAddress.Loopback, 0);
+        silent.Start();
+        Task<TcpClient> accepted = silent.AcceptTcpClientAsync();
+
+        await using MsmtPeer peer = new(new MsmtOptions { Credentials = new MsmtCredentials { Identity = certificateA, TrustedAuthorities = trustedAuthorities } });
+
+        using CancellationTokenSource cancellation = new(TimeSpan.FromMilliseconds(500));
+        MsmtTarget target = new() { Host = "127.0.0.1", Port = ((IPEndPoint)silent.LocalEndpoint).Port };
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => peer.Test(target, cancellation.Token).WaitAsync(TimeSpan.FromSeconds(5)));
+
+        using TcpClient remote = await accepted;
+    }
+
+    /// <summary>A <see cref="MsmtPeer.Request"/> cancelled while the remote peer never answers the TLS handshake is reported as cancelled, after <see cref="IMsmtPeer.LinkFailed"/>.</summary>
+    [Fact]
+    public async Task Request_CancelledWhileRemoteNeverCompletesHandshake_ThrowsOperationCanceled()
+    {
+        (X509Certificate2 certificateA, _, X509Certificate2Collection trustedAuthorities) = TestMsmtCertificates.Create();
+
+        using TcpListener silent = new(IPAddress.Loopback, 0);
+        silent.Start();
+        Task<TcpClient> accepted = silent.AcceptTcpClientAsync();
+
+        await using MsmtPeer peer = new(new MsmtOptions { Credentials = new MsmtCredentials { Identity = certificateA, TrustedAuthorities = trustedAuthorities } });
+
+        TaskCompletionSource<MsmtLinkFailedEventArgs> linkFailed = new();
+        peer.LinkFailed.Subscribe(args => linkFailed.TrySetResult(args));
+
+        using CancellationTokenSource cancellation = new(TimeSpan.FromMilliseconds(500));
+        MsmtTarget target = new() { Host = "127.0.0.1", Port = ((IPEndPoint)silent.LocalEndpoint).Port };
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => peer.Request(target, "hello"u8.ToArray(), cancellation: cancellation.Token).WaitAsync(TimeSpan.FromSeconds(5)));
+        await linkFailed.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        using TcpClient remote = await accepted;
+    }
+
+    /// <summary>Disposing a peer more than once, synchronously then asynchronously, does not throw.</summary>
+    [Fact]
+    public async Task Dispose_ThenDisposeAsync_DoesNotThrow()
+    {
+        (X509Certificate2 certificateA, _, X509Certificate2Collection trustedAuthorities) = TestMsmtCertificates.Create();
+
+        MsmtPeer peer = new(new MsmtOptions { Credentials = new MsmtCredentials { Identity = certificateA, TrustedAuthorities = trustedAuthorities }, RequireFullyQualifiedHostname = false });
+        peer.StartListener(0, "127.0.0.1");
+
+        peer.Dispose();
+        peer.Dispose();
+        await peer.DisposeAsync();
+
+        Assert.False(peer.IsListening);
+    }
+
+    /// <summary>Disconnecting the same sending link twice does not throw.</summary>
+    [Fact]
+    public async Task Disconnect_SenderLinkTwice_DoesNotThrow()
+    {
+        (X509Certificate2 certificateA, X509Certificate2 certificateB, X509Certificate2Collection trustedAuthorities) = TestMsmtCertificates.Create();
+
+        await using MsmtPeer peerB = new(new MsmtOptions { Credentials = new MsmtCredentials { Identity = certificateB, TrustedAuthorities = trustedAuthorities }, RequireFullyQualifiedHostname = false });
+        await using MsmtPeer peerA = new(new MsmtOptions
+        {
+            Credentials = new MsmtCredentials { Identity = certificateA, TrustedAuthorities = trustedAuthorities },
+            Mode = MsmtOperationMode.MessageWithRekeying,
+            RekeyLimit = 100,
+        });
+
+        peerB.StartListener(0, "127.0.0.1");
+
+        await SendAndWaitForResponse(peerA, peerB.Listener!, "hello"u8.ToArray());
+        IMsmtLink sender = peerA.GetActiveConnection(peerB.Listener!)!.Sender!;
+
+        await sender.Disconnect();
+        await sender.Disconnect();
+        sender.Drop();
+    }
+
+    /// <summary>Once disposed, a peer rejects further use rather than silently creating connections that are never cleaned up.</summary>
+    [Fact]
+    public async Task SendRequestTestAndStartListener_AfterDisposeAsync_ThrowObjectDisposed()
+    {
+        (X509Certificate2 certificateA, _, X509Certificate2Collection trustedAuthorities) = TestMsmtCertificates.Create();
+
+        MsmtPeer peer = new(new MsmtOptions { Credentials = new MsmtCredentials { Identity = certificateA, TrustedAuthorities = trustedAuthorities } });
+        await peer.DisposeAsync();
+
+        MsmtTarget target = new() { Host = "127.0.0.1", Port = 1 };
+        Assert.Throws<ObjectDisposedException>(() => peer.Send(target, "hello"u8.ToArray()));
+        await Assert.ThrowsAsync<ObjectDisposedException>(() => peer.Request(target, "hello"u8.ToArray()));
+        await Assert.ThrowsAsync<ObjectDisposedException>(() => peer.Test(target));
+        Assert.Throws<ObjectDisposedException>(() => peer.StartListener(0, "127.0.0.1"));
+    }
+
+    /// <summary>
+    /// If <see cref="MsmtPeer.StartListener"/> fails to bind, the peer is left not listening, rather than still
+    /// reporting the previous (already stopped) listener as active.
+    /// </summary>
+    [Fact]
+    public void StartListener_PortAlreadyInUse_ThrowsAndLeavesPeerNotListening()
+    {
+        (X509Certificate2 certificateA, _, X509Certificate2Collection trustedAuthorities) = TestMsmtCertificates.Create();
+
+        using TcpListener occupier = new(IPAddress.Loopback, 0);
+        occupier.Start();
+        int busyPort = ((IPEndPoint)occupier.LocalEndpoint).Port;
+
+        using MsmtPeer peer = new(new MsmtOptions { Credentials = new MsmtCredentials { Identity = certificateA, TrustedAuthorities = trustedAuthorities } });
+        peer.StartListener(0, "127.0.0.1");
+        Assert.True(peer.IsListening);
+
+        Assert.Throws<SocketException>(() => peer.StartListener(busyPort, "127.0.0.1"));
+
+        Assert.False(peer.IsListening);
+        Assert.Null(peer.Listener);
+    }
+
+    private async Task<MsmtResponse> SendAndWaitForResponse(IMsmtPeer peer, MsmtNameTarget target, ReadOnlyMemory<byte> payload) =>
         await peer.Request(target, payload).WaitAsync(TimeSpan.FromSeconds(5));
 }

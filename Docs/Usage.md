@@ -24,13 +24,8 @@ using BlueHeighliner.Msmt;
 // address rather than a real DNS hostname; leave it enabled (the default) whenever a hostname is used.
 IMsmtPeer peer = new MsmtPeerFactory().Create(new MsmtOptions { Credentials = credentials, RequireFullyQualifiedHostname = false });
 
-peer.Received.Subscribe(args =>
-{
-    using (args.Payload)
-    {
-        Console.WriteLine(Encoding.UTF8.GetString(args.Payload.Memory.Span));
-    }
-});
+// The peer disposes args.Payload once every subscriber has run; copy anything needed beyond that.
+peer.Received.Subscribe(args => Console.WriteLine(Encoding.UTF8.GetString(args.Payload.Memory.Span)));
 
 peer.StartListener(port: 5000);
 peer.Send(new MsmtTarget { Host = "127.0.0.1", Port = 5000 }, "hello"u8.ToArray());
@@ -53,10 +48,7 @@ IMsmtPeer server = peerFactory.Create(new MsmtOptions { Credentials = serverCred
 
 server.Received.Subscribe(args =>
 {
-    using (args.Payload)
-    {
-        Console.WriteLine(Encoding.UTF8.GetString(args.Payload.Memory.Span));
-    }
+    Console.WriteLine(Encoding.UTF8.GetString(args.Payload.Memory.Span));
 
     // Only meaningful if args.IsResponseRequested is true (i.e. the sender used Request, not Send) -
     // calling Accept/Reject otherwise throws. If a response was requested but no subscriber decides,
@@ -122,20 +114,23 @@ pending?.Accept();
 ```
 
 `Defer()` suppresses the automatic acceptance that would otherwise happen once every subscriber has run,
-so something else — a background task, a queue, another connection's handler — can call `Accept`/`Reject`
+so something else - a background task, a queue, another connection's handler - can call `Accept`/`Reject`
 at some later point instead. Since MSMT never has more than one message in flight per connection, that
 connection reads no further message until the responder is decided, so hold onto a deferred
-`IMsmtResponder` only as long as actually needed.
+`IMsmtResponder` only as long as actually needed. If the peer shuts down first, the connection closes
+without acknowledging the message, and the sender's `Request` fails.
 
 ## Sending with pooled memory
 
 `IMsmtPeer.Send`/`.Request` (and `IMsmtResponder.Accept`/`.Reject`) each have two overloads: one taking a
-`ReadOnlyMemory<byte>` (copied into a non-pooled wrapper, used above), and one taking ownership of an
-`IMemoryOwner<byte>` — e.g. rented from `MemoryPool<byte>.Shared` — avoiding a copy for callers already
-using pooled buffers:
+`ReadOnlyMemory<byte>` (wrapped without copying, so it must not be mutated until the send completes; used
+above), and one taking ownership of an `IMemoryOwner<byte>`, avoiding an allocation per message for
+callers already using pooled buffers. The whole of the owner's `Memory` is sent, and
+`MemoryPool<byte>.Shared.Rent` may return a larger buffer than requested, so trim it to the payload's
+exact length with `Slice(start, length)`:
 
 ```csharp
-IMemoryOwner<byte> owner = MemoryPool<byte>.Shared.Rent(payload.Length);
+IMemoryOwner<byte> owner = MemoryPool<byte>.Shared.Rent(payload.Length).Slice(0, payload.Length);
 payload.CopyTo(owner.Memory.Span);
 
 // The peer disposes `owner` once the send completes, successfully or not - do not use or dispose it
@@ -143,11 +138,15 @@ payload.CopyTo(owner.Memory.Span);
 peer.Send(target, owner);
 ```
 
-`Received`'s payload (`MsmtReceivedEventArgs.Payload`) and a response's payload (`MsmtResponse.Payload`,
-returned by `Request`) are likewise pooled `IMemoryOwner<byte>` values whose ownership transfers to
-whoever handles them, who should dispose them once done (see the `using` in the examples above). An
+`Slice` returns a new owner over the same buffer; disposing it still returns the whole rented buffer to
+its pool, and the owner it was called on must not be disposed separately.
+
+A response's payload (`MsmtResponse.Payload`, returned by `Request`) is likewise a pooled
+`IMemoryOwner<byte>` whose ownership transfers to the caller, who should dispose it once done. An
 acknowledgement payload passed to `Accept`/`Reject` transfers ownership the same way, to the
-`IMsmtResponder`, which disposes it once sent.
+`IMsmtResponder`, which disposes it once sent. `Received`'s payload (`MsmtReceivedEventArgs.Payload`) is
+the exception: the peer disposes it once every subscriber has run, so subscribers must neither dispose it
+nor keep it, and should copy anything they need beyond that.
 
 ## Tracking a send with a tag
 
@@ -163,7 +162,7 @@ peer.PackageChanged.Subscribe(args =>
     }
 });
 
-IMsmtPackage? package = peer.GetPackage(tag); // null once no send was ever queued with this tag
+IMsmtPackage? package = peer.GetPackage(tag); // null if no send was ever queued with this tag, or it was long forgotten
 package?.Cancel(); // best-effort: cancels immediately if still queued, or force-closes the connection if already in flight
 
 IReadOnlyList<IMsmtPackage> active = peer.Packages; // every currently active (not yet finished) package
@@ -171,16 +170,19 @@ IReadOnlyList<IMsmtPackage> active = peer.Packages; // every currently active (n
 
 `MsmtPackageChangedEventArgs.Status` is fixed at the moment this event was raised. `args.Package.Status`
 instead always reflects the package's *current* status, which may have already moved on by the time a
-subscriber gets to it — e.g. because an earlier subscriber ran slowly, or the send kept progressing
-concurrently on another thread — so prefer `args.Status` when reacting to this specific transition.
+subscriber gets to it - e.g. because an earlier subscriber ran slowly, or the send kept progressing
+concurrently on another thread - so prefer `args.Status` when reacting to this specific transition.
 
 An untagged send (`Tag = null`, the default) never publishes to `PackageChanged` and has no
-`IMsmtPackage` to look up via `GetPackage` or cancel.
+`IMsmtPackage` to look up via `GetPackage` or cancel. A tagged send is tracked by the peer itself, so its
+package stays available even after the pooled connection that carried it has been evicted. A finished send's
+package is forgotten five minutes after it completed or was cancelled, and a tag identifies a send
+peer-wide.
 
 ## Marking QoS with DSCP
 
 Per the ICD, a send may mark its packets with a DSCP (Differentiated Services Code Point) for
-network-level quality of service — a 6-bit value from 0 to 63 (e.g. 46 for the standard Expedited
+network-level quality of service - a 6-bit value from 0 to 63 (e.g. 46 for the standard Expedited
 Forwarding class); assigning anything outside that range throws `ArgumentOutOfRangeException`:
 
 ```csharp
@@ -188,16 +190,16 @@ peer.Send(target, payload, new MsmtSendOptions { Dscp = 46 });
 ```
 
 The mark is applied to the underlying TCP socket immediately before that payload is written, not once
-per connection — so a `Session`/`MessageWithRekeying` connection cached and reused across sends is
+per connection - so a `Session`/`MessageWithRekeying` connection cached and reused across sends is
 re-marked for each one, even if a later send requests a different value than an earlier one on the same
 connection. Marking is best-effort: the ICD does not mandate any particular value or guarantee that a
-network — or even the local platform — honors it, and a platform that rejects the marking does not fail
+network - or even the local platform - honors it, and a platform that rejects the marking does not fail
 the send. Omit `Dscp` (the default) to leave the socket unmarked.
 
 ## Reachability check
 
 `Test` establishes a connection and exchanges a specially flagged message that the remote peer's
-listener echoes back without ever publishing to `Received` — a "ping" that verifies a peer is reachable
+listener echoes back without ever publishing to `Received` - a "ping" that verifies a peer is reachable
 and correctly configured without generating real message traffic or invoking application logic:
 
 ```csharp
@@ -227,8 +229,34 @@ same address and port is instead. Returns `null` if no connection for the target
 currently has neither link linked yet or both linked at once.
 
 `MsmtOptions.MaxIdleTime`/`MaxConnectionCount` also evict connections automatically - both the on-demand
-ones a peer creates and the ones its listener accepts.
+ones a peer creates and the ones its listener accepts - so a caller who never manages connections by hand
+still ends up with a pool of the ones it actually uses. `MaxIdleTime` counts application traffic only (a
+Session connection kept alive by keep-alives is still evicted once nothing is sent on it), applies in every
+mode, and also discards the idle pool entry; the next send simply creates a new one. Set it to `null` to
+never evict for being unused.
 
+## Timeouts and connection health
+
+```csharp
+MsmtOptions options = new()
+{
+    Credentials = credentials,
+    HandshakeTimeout = TimeSpan.FromSeconds(30), // TCP connect + TLS handshake (and a listener's wait for a first message)
+    StallTimeout = TimeSpan.FromSeconds(30),     // no bytes moving while transferring a message
+    ResponseTimeout = TimeSpan.FromMinutes(2),   // waiting for the remote application's acknowledgement
+    TcpKeepAliveTime = TimeSpan.FromSeconds(60), // OS-level probing of a silent connection
+};
+```
+
+A phase that runs out of time drops the connection and surfaces as a `TimeoutException`: from `Request`
+and `Test` to their callers, and through `LinkFailed`/`Unlinked` to observers. Each can be `null` to
+disable it. `ResponseTimeout` is the one to raise if a subscriber legitimately defers its response for
+longer than the default. A cancelled `CancellationToken` still surfaces as `OperationCanceledException`.
+
+In `Session` mode the client sends a keep-alive after a randomized `KeepAliveMinInterval` to
+`KeepAliveMaxInterval` (3 to 5 minutes by default, per the ICD) without traffic, and both sides close the
+connection when its negotiated lifetime ends. `RekeyLimit` is enforced by both sides for
+`MessageWithRekeying`.
 ## Connection lifecycle modes
 
 ```csharp
@@ -240,15 +268,16 @@ MsmtOptions options = new()
 };
 ```
 
-`SupportsSessionMode`/`MaximumSessionLifetime` instead govern this peer's *listener* — whether it accepts
+`SupportsSessionMode`/`MaximumSessionLifetime` instead govern this peer's *listener* - whether it accepts
 a Session Mode negotiation request at all, and the cap it applies to what a connecting client proposes.
 
 ## Disposal
 
 `IMsmtPeer` implements both `IDisposable` and `IAsyncDisposable`: `Dispose()` immediately stops
-accepting new connections and closes every open connection — both accepted and on-demand — without
+accepting new connections and closes every open connection - both accepted and on-demand - without
 waiting for background work to finish; `DisposeAsync()` waits for that work to fully stop first, for a
-graceful shutdown:
+graceful shutdown. Either may be called more than once; afterward, `StartListener`, `Send`, `Request`,
+and `Test` throw `ObjectDisposedException`:
 
 ```csharp
 await using IMsmtPeer peer = peerFactory.Create(options);

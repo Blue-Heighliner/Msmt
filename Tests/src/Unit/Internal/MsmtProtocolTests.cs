@@ -21,29 +21,6 @@ public sealed class MsmtProtocolTests
         Assert.True(IPAddress.IsLoopback(address));
     }
 
-    /// <summary><see cref="MsmtProtocol.ClonePooled"/> copies the source into a new, independent pooled buffer.</summary>
-    [Fact]
-    public void ClonePooled_NonEmptySource_CopiesIntoIndependentBuffer()
-    {
-        byte[] source = [1, 2, 3, 4];
-
-        using IMemoryOwner<byte> clone = MsmtProtocol.ClonePooled(source);
-
-        Assert.Equal(source, clone.Memory.ToArray());
-
-        source[0] = 99;
-        Assert.Equal(1, clone.Memory.Span[0]);
-    }
-
-    /// <summary><see cref="MsmtProtocol.ClonePooled"/> handles an empty source, returning an empty buffer.</summary>
-    [Fact]
-    public void ClonePooled_EmptySource_ReturnsEmptyBuffer()
-    {
-        using IMemoryOwner<byte> clone = MsmtProtocol.ClonePooled(ReadOnlyMemory<byte>.Empty);
-
-        Assert.True(clone.Memory.IsEmpty);
-    }
-
     /// <summary>A duration within <see cref="MsmtProtocol.MaxTimerDuration"/> passes through unchanged.</summary>
     [Fact]
     public void ClampToMaxTimerDuration_WithinLimit_ReturnsUnchanged()

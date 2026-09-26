@@ -21,11 +21,21 @@ internal sealed record MsmtConnectOptions
     /// <summary>Gets the number of messages sent via a TLS 1.3 key update before <see cref="MsmtOperationMode.MessageWithRekeying"/> forces a full connection reset.</summary>
     public int RekeyLimit { get; init; } = 3;
 
-    /// <summary>
-    /// Gets the maximum time this client's connection may go without a queued send arriving before it is
-    /// automatically disconnected, or <see langword="null"/> to disable this rule and never automatically
-    /// disconnect for being idle. Never interrupts a send already queued or in flight - only a fully idle
-    /// connection (no sends outstanding) is ever disconnected this way.
-    /// </summary>
-    public TimeSpan? MaxIdleTime { get; init; } = TimeSpan.FromMinutes(5);
+    /// <summary>Gets how long the TCP connection attempt and TLS handshake may take, or <see langword="null"/> for no limit.</summary>
+    public TimeSpan? HandshakeTimeout { get; init; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>Gets how long writing a message may make no progress before the connection is dropped, or <see langword="null"/> for no limit.</summary>
+    public TimeSpan? StallTimeout { get; init; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>Gets how long to wait for a message's acknowledgement once it is fully written, or <see langword="null"/> for no limit.</summary>
+    public TimeSpan? ResponseTimeout { get; init; } = TimeSpan.FromMinutes(2);
+
+    /// <summary>Gets how long the TCP connection may be silent before the operating system starts probing the remote host, or <see langword="null"/> to leave TCP keep-alive disabled.</summary>
+    public TimeSpan? TcpKeepAliveTime { get; init; } = TimeSpan.FromSeconds(60);
+
+    /// <summary>Gets the shortest idle time before a <see cref="MsmtOperationMode.Session"/> connection sends a keep-alive.</summary>
+    public TimeSpan KeepAliveMinInterval { get; init; } = TimeSpan.FromMinutes(3);
+
+    /// <summary>Gets the longest idle time before a <see cref="MsmtOperationMode.Session"/> connection sends a keep-alive.</summary>
+    public TimeSpan KeepAliveMaxInterval { get; init; } = TimeSpan.FromMinutes(5);
 }

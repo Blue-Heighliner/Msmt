@@ -10,25 +10,40 @@ internal sealed class MsmtServerConnection(MsmtTarget target) : IMsmtLink
     private Action? close;
     private Func<Task>? disconnect;
     private long lastActivityTicks;
+    private Exception? closeReason;
+    private volatile bool hasCloseReason;
+    private volatile bool isConnected;
+    private volatile bool isIdle;
 
     /// <summary>
     /// Gets a value indicating whether this connection's TLS handshake has completed and the connection is
     /// still open - <see langword="false"/> both before the handshake completes and after the connection
     /// closes, mirroring <see cref="MsmtClient.IsConnected"/>'s symmetric meaning for the sending direction.
     /// </summary>
-    internal bool IsConnected { get; private set; }
+    internal bool IsConnected => isConnected;
 
     /// <summary>
     /// Gets a value indicating whether this connection is currently waiting for its next message header,
     /// as opposed to actively reading, processing, or acknowledging one - <see langword="false"/> during
     /// the handshake and for the duration of every message cycle, and between <see cref="MarkIdle"/> and
     /// <see cref="MarkBusy"/> otherwise. Used by <see cref="MsmtOptions.MaxIdleTime"/>/<see
-    /// cref="MsmtOptions.MaxConnectionCount"/> eviction to never interrupt a message cycle in progress.
+    /// cref="MsmtOptions.MaxConnectionCount"/> eviction and the session lifetime backstop to never
+    /// interrupt a message cycle in progress.
     /// </summary>
-    internal bool IsIdle { get; private set; }
+    internal bool IsIdle => isIdle;
 
-    /// <summary>Gets the last time this connection finished a message cycle and started waiting for the next one.</summary>
+    /// <summary>
+    /// Gets the last time this connection completed its handshake or finished acknowledging an application
+    /// message. Reachability checks and session negotiation are not application traffic and don't count, so
+    /// a client that only sends keep-alives still ages toward <see cref="MsmtOptions.MaxIdleTime"/>.
+    /// </summary>
     internal DateTime LastActivityUtc => new(Interlocked.Read(ref lastActivityTicks), DateTimeKind.Utc);
+
+    /// <summary>Gets a value indicating whether the server deliberately closed this connection, in which case <see cref="CloseReason"/> is what it reports instead of the read failure the close causes.</summary>
+    internal bool HasCloseReason => hasCloseReason;
+
+    /// <summary>Gets why the server deliberately closed this connection, or <see langword="null"/> if it closed it normally.</summary>
+    internal Exception? CloseReason => closeReason;
 
     /// <summary>Gets the connecting client's observed address and port, used to attach this link to its owning <see cref="MsmtConnection"/>.</summary>
     internal MsmtTarget Target { get; } = target;
@@ -65,19 +80,41 @@ internal sealed class MsmtServerConnection(MsmtTarget target) : IMsmtLink
     /// <param name="identity">The extracted identity.</param>
     internal void SetIdentity(MsmtIdentity identity) => Identity = identity;
 
-    /// <summary>Marks this connection as open once its handshake completes.</summary>
-    internal void MarkConnected() => IsConnected = true;
-
-    /// <summary>Marks this connection as closed once its accepting loop has finished.</summary>
-    internal void MarkDisconnected() => IsConnected = false;
-
-    /// <summary>Marks this connection as waiting for its next message header, recording the current time as its last activity.</summary>
-    internal void MarkIdle()
+    /// <summary>Marks this connection as open once its handshake completes, counting that as its first activity.</summary>
+    internal void MarkConnected()
     {
         Interlocked.Exchange(ref lastActivityTicks, DateTime.UtcNow.Ticks);
-        IsIdle = true;
+        isConnected = true;
     }
 
+    /// <summary>Immediately closes this connection's socket on the server's own initiative.</summary>
+    /// <param name="reason">Reported as the connection's disconnection exception, or <see langword="null"/> for a normal close.</param>
+    internal void CloseWith(Exception? reason)
+    {
+        closeReason = reason;
+        hasCloseReason = true;
+        close?.Invoke();
+    }
+
+    /// <summary>Cleanly closes this connection on the server's own initiative, waiting for its accepting loop to finish.</summary>
+    /// <param name="reason">Reported as the connection's disconnection exception.</param>
+    /// <returns>A task that completes once the connection has closed.</returns>
+    internal Task Evict(Exception reason)
+    {
+        closeReason = reason;
+        hasCloseReason = true;
+        return Disconnect();
+    }
+
+    /// <summary>Marks this connection as closed once its accepting loop has finished.</summary>
+    internal void MarkDisconnected() => isConnected = false;
+
+    /// <summary>Marks this connection as waiting for its next message header.</summary>
+    internal void MarkIdle() => isIdle = true;
+
+    /// <summary>Records that this connection just finished acknowledging an application message.</summary>
+    internal void MarkActivity() => Interlocked.Exchange(ref lastActivityTicks, DateTime.UtcNow.Ticks);
+
     /// <summary>Marks this connection as no longer idle, since a message header has just been read.</summary>
-    internal void MarkBusy() => IsIdle = false;
+    internal void MarkBusy() => isIdle = false;
 }

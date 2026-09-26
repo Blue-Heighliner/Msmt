@@ -7,46 +7,48 @@ namespace BlueHeighliner.Msmt.Internal;
 /// </summary>
 /// <remarks>
 /// Queued sends are processed one at a time, in priority order and first-in-first-out within a priority,
-/// by a single background loop that also owns the underlying connection. A second background loop
-/// automatically sends a reachability check as a keep-alive whenever an established <see
-/// cref="MsmtOperationMode.Session"/> connection has been idle for a randomized three-to-five-minute
-/// interval, per the ICD. The TLS handshake runs on the BouncyCastle TLS engine's own blocking API (there
-/// is no cancellable async overload), so a cancellation token passed to a <c>Send</c> overload, or <see
-/// cref="Cancel"/> called against a tagged send's own tag, cannot interrupt a handshake already in
-/// progress; once connected, either one instead forces the underlying socket closed the instant it fires
-/// (see <see cref="SendOverConnection"/>), promptly unblocking a write or acknowledgement read already in
-/// flight - the BouncyCastle stream itself does not honor the token on a read/write already blocked, only
-/// a direct socket close does. Since sending only enqueues a payload and never
-/// surfaces an exception directly, <see cref="Unlinked"/> also fires - carrying the causing exception -
-/// when a connection attempt itself fails, not only when an already-established connection closes.
+/// by a single background loop that also owns the underlying connection. A second background loop queues a
+/// maintenance check once a second while a connection is open, run by the processing loop so it never races
+/// a send: it closes a <see cref="MsmtOperationMode.Session"/> connection whose negotiated lifetime has
+/// ended, notices a connection the remote peer closed while idle, and sends a reachability check as a
+/// keep-alive once a Session connection has been silent for its randomized interval, per the ICD.
+/// Neither BouncyCastle's blocking handshake nor its TLS stream honors a cancellation token once blocked,
+/// so a send's cancellation token, <see cref="Cancel"/> against its tag, disposal, and the handshake,
+/// stall and response timeouts all work by forcing the underlying socket closed (see <see
+/// cref="MsmtWatchdog"/>), promptly interrupting whatever was in flight.
 /// </remarks>
-internal sealed class MsmtClient : IMsmtLink
+internal sealed class MsmtClient(IMsmtPackageTracker? packageTracker = null) : IMsmtLink
 {
+    private readonly IMsmtPackageTracker tracker = packageTracker ?? new MsmtPackageTracker();
     private readonly PriorityQueue<PendingSend, (int NegatedPriority, long Sequence)> queue = new();
     private readonly Lock queueLock = new();
+
+    // Neither this nor disposalCancellation is ever disposed, and neither holds anything that needs releasing:
+    // a racing Enqueue may still release this, and background work may still read disposalCancellation's
+    // Token, which throws once disposed, after shutdown.
     private readonly SemaphoreSlim queueSignal = new(0);
     private readonly CancellationTokenSource disposalCancellation = new();
     private readonly Random keepAliveRandom = new();
-    private readonly TimeSpan keepAliveCheckInterval = TimeSpan.FromSeconds(15);
-    private readonly ConcurrentDictionary<object, PendingSend> activeSends = new();
-    private readonly ConcurrentDictionary<object, MsmtSendStatus> sendStatuses = new();
-    private readonly ConcurrentQueue<object> completedSendTags = new();
-    private readonly int maxTrackedCompletedSendStatuses = 10_000;
+    private readonly TimeSpan maintenanceInterval = TimeSpan.FromSeconds(1);
+    private readonly MsmtNameTarget unconnectedTarget = new() { Host = string.Empty, Port = 0, ServerName = string.Empty };
 
     private MsmtConnectOptions options = null!;
     private Action? removeFromCache;
     private long sendSequence;
     private Task? processingLoop;
-    private Task? keepAliveLoop;
+    private Task? maintenanceLoop;
     private TcpClient? tcpClient;
+    private MsmtWatchdog? watchdog;
     private RekeyableTlsClientProtocol? connection;
     private MsmtIdentity? remoteIdentity;
     private DateTime sessionExpiresAtUtc;
-    private long lastActivityTicks;
+    private long lastActivityTicks = DateTime.UtcNow.Ticks;
+    private long lastWireActivityTicks = DateTime.UtcNow.Ticks;
     private int outstandingSends;
-    private int idleCheckScheduled;
+    private int maintenanceQueued;
     private TimeSpan keepAliveInterval;
     private int messagesSinceConnect;
+    private bool isDisposed;
 
     /// <summary>Raised whenever this client begins attempting to establish a new outgoing connection to its remote server.</summary>
     public event EventHandler<MsmtLinkingEventArgs> Linking = delegate { };
@@ -67,14 +69,17 @@ internal sealed class MsmtClient : IMsmtLink
     internal bool IsConnected => connection is not null;
 
     /// <summary>
-    /// Gets a value indicating whether this client currently has no send queued or in flight. Used by <see
-    /// cref="MsmtOptions.MaxIdleTime"/>/<see cref="MsmtOptions.MaxConnectionCount"/> eviction, and this
-    /// client's own idle-timeout check, to never interrupt a send/request-response cycle in progress.
+    /// Gets a value indicating whether this client currently has no send queued or in flight, and no <see
+    /// cref="Reserve"/> outstanding. Used by <see cref="MsmtOptions.MaxConnectionCount"/> eviction to never
+    /// interrupt a send/request-response cycle in progress, or one about to be queued.
     /// </summary>
     internal bool IsIdle => Volatile.Read(ref outstandingSends) == 0;
 
-    /// <summary>Gets the last time a send completed on this client's connection and it started waiting for the next one.</summary>
+    /// <summary>Gets the last time an application send completed on this client, not counting keep-alives or session negotiation.</summary>
     internal DateTime LastActivityUtc => new(Interlocked.Read(ref lastActivityTicks), DateTimeKind.Utc);
+
+    /// <summary>Gets the last time any message, including a keep-alive or session negotiation, completed on this client's connection. Exposed for diagnostics and testing.</summary>
+    internal DateTime LastWireActivityUtc => new(Interlocked.Read(ref lastWireActivityTicks), DateTimeKind.Utc);
 
     /// <summary>Gets the remote server this client sends to, used as every one of its packages' <see cref="IMsmtPackage.Target"/>.</summary>
     internal MsmtNameTarget Target => options.Target;
@@ -91,9 +96,6 @@ internal sealed class MsmtClient : IMsmtLink
     /// <inheritdoc />
     public IMsmtConnection Connection { get; private set; } = null!;
 
-    /// <summary>Gets a snapshot of this client's currently active (not yet completed or cancelled) tagged packages.</summary>
-    public IReadOnlyList<IMsmtPackage> Packages => [.. activeSends.Keys.Select(GetPackage).OfType<IMsmtPackage>()];
-
     /// <summary>
     /// Starts this client's background send-processing loop, transitioning it from its initial unstarted
     /// state to a started state ready to accept sends.
@@ -104,7 +106,7 @@ internal sealed class MsmtClient : IMsmtLink
     {
         this.options = options;
         processingLoop ??= Task.Run(ProcessQueueLoop);
-        keepAliveLoop ??= Task.Run(KeepAliveLoop);
+        maintenanceLoop ??= Task.Run(MaintenanceLoop);
         return Task.CompletedTask;
     }
 
@@ -118,6 +120,16 @@ internal sealed class MsmtClient : IMsmtLink
     /// <summary>Attaches the connection this client belongs to.</summary>
     /// <param name="connection">This client's owning connection.</param>
     internal void AttachConnection(IMsmtConnection connection) => Connection = connection;
+
+    /// <summary>
+    /// Holds this client non-idle (see <see cref="IsIdle"/>) until the matching <see
+    /// cref="ReleaseReservation"/>, so eviction can't dispose it between a caller looking it up and queuing
+    /// a send on it.
+    /// </summary>
+    internal void Reserve() => Interlocked.Increment(ref outstandingSends);
+
+    /// <summary>Releases a hold taken by <see cref="Reserve"/>.</summary>
+    internal void ReleaseReservation() => Interlocked.Decrement(ref outstandingSends);
 
     /// <summary>Immediately abandons this client's cache entry and closes its connection without waiting.</summary>
     public void Drop()
@@ -145,11 +157,13 @@ internal sealed class MsmtClient : IMsmtLink
     /// <param name="options">Options governing how this payload is sent, or <see langword="null"/> to use the defaults.</param>
     /// <param name="cancellation">Cancels the queued send before it is processed.</param>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="payload"/> is longer than <see cref="MsmtLimits.MaxPayloadLength"/>.</exception>
+    /// <exception cref="ObjectDisposedException">This client has been disposed.</exception>
     public void Send(IMemoryOwner<byte> payload, MsmtSendOptions? options = null, CancellationToken cancellation = default)
     {
         MsmtProtocol.ValidatePayloadLength(payload.Memory.Length, nameof(payload));
         MsmtSendOptions sendOptions = options ?? new MsmtSendOptions();
-        Enqueue(payload, MsmtMessageFlags.None, sendOptions.Tag, sendOptions.Priority, sendOptions.Dscp, cancellation, null);
+        bool isQueued = Enqueue(payload, MsmtMessageFlags.None, sendOptions.Tag, sendOptions.Priority, sendOptions.Dscp, cancellation, null);
+        ObjectDisposedException.ThrowIf(!isQueued, this);
     }
 
     /// <summary>
@@ -161,6 +175,7 @@ internal sealed class MsmtClient : IMsmtLink
     /// <param name="options">Options governing how this payload is sent, or <see langword="null"/> to use the defaults.</param>
     /// <param name="cancellation">Cancels the queued send before it is processed.</param>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="payload"/> is longer than <see cref="MsmtLimits.MaxPayloadLength"/>.</exception>
+    /// <exception cref="ObjectDisposedException">This client has been disposed.</exception>
     public void Send(ReadOnlyMemory<byte> payload, MsmtSendOptions? options = null, CancellationToken cancellation = default) =>
         Send(new NonOwningMemoryOwner(payload), options, cancellation);
 
@@ -175,12 +190,14 @@ internal sealed class MsmtClient : IMsmtLink
     /// <param name="cancellation">Cancels the request before it completes.</param>
     /// <returns>The remote server's acknowledgement.</returns>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="payload"/> is longer than <see cref="MsmtLimits.MaxPayloadLength"/>.</exception>
+    /// <exception cref="ObjectDisposedException">This client has been disposed.</exception>
     public Task<MsmtResponse> Request(IMemoryOwner<byte> payload, MsmtSendOptions? options = null, CancellationToken cancellation = default)
     {
         MsmtProtocol.ValidatePayloadLength(payload.Memory.Length, nameof(payload));
         MsmtSendOptions sendOptions = options ?? new MsmtSendOptions();
         TaskCompletionSource<MsmtResponse> responseSource = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        Enqueue(payload, MsmtMessageFlags.AcknowledgementRequestedOrGiven, sendOptions.Tag, sendOptions.Priority, sendOptions.Dscp, cancellation, responseSource);
+        bool isQueued = Enqueue(payload, MsmtMessageFlags.AcknowledgementRequestedOrGiven, sendOptions.Tag, sendOptions.Priority, sendOptions.Dscp, cancellation, responseSource);
+        ObjectDisposedException.ThrowIf(!isQueued, this);
         return responseSource.Task;
     }
 
@@ -194,6 +211,7 @@ internal sealed class MsmtClient : IMsmtLink
     /// <param name="cancellation">Cancels the request before it completes.</param>
     /// <returns>The remote server's acknowledgement.</returns>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="payload"/> is longer than <see cref="MsmtLimits.MaxPayloadLength"/>.</exception>
+    /// <exception cref="ObjectDisposedException">This client has been disposed.</exception>
     public Task<MsmtResponse> Request(ReadOnlyMemory<byte> payload, MsmtSendOptions? options = null, CancellationToken cancellation = default) =>
         Request(new NonOwningMemoryOwner(payload), options, cancellation);
 
@@ -203,42 +221,17 @@ internal sealed class MsmtClient : IMsmtLink
     /// Does nothing if no send is currently outstanding for that tag.
     /// </summary>
     /// <param name="tag">The tag identifying the send to cancel, as passed to <see cref="Send(IMemoryOwner{byte}, MsmtSendOptions?, CancellationToken)"/>.</param>
-    public void Cancel(object tag)
-    {
-        if (activeSends.TryGetValue(tag, out PendingSend? item))
-        {
-            try
-            {
-                item.CancelSource.Cancel();
-            }
-            catch (ObjectDisposedException)
-            {
-                // The send raced to completion and disposed its CancelSource between TryGetValue above and
-                // this call; nothing left to cancel.
-            }
-        }
-    }
+    public void Cancel(object tag) => tracker.Cancel(tag);
 
     /// <summary>
     /// Gets the current status of the tagged send previously queued via <see cref="Send(IMemoryOwner{byte},
     /// MsmtSendOptions?, CancellationToken)"/> with <paramref name="tag"/>. A completed or cancelled tag's
-    /// status is retained only for a bounded number of the most recently finished sends, so this may also
-    /// return <see langword="null"/> for a tag whose send finished long enough ago to have been forgotten.
+    /// status is forgotten five minutes after the send finished, so this may also return <see
+    /// langword="null"/> for a tag whose send finished longer ago than that.
     /// </summary>
     /// <param name="tag">The tag identifying the send to look up, as passed to <see cref="Send(IMemoryOwner{byte}, MsmtSendOptions?, CancellationToken)"/>.</param>
     /// <returns>The send's current status, or <see langword="null"/> if no send was ever queued with this tag, or its status has since been forgotten.</returns>
-    public MsmtSendStatus? GetStatus(object tag) =>
-        sendStatuses.TryGetValue(tag, out MsmtSendStatus status) ? status : null;
-
-    /// <summary>
-    /// Gets the package for the tagged send previously queued via <see cref="Send(IMemoryOwner{byte},
-    /// MsmtSendOptions?, CancellationToken)"/> with <paramref name="tag"/>, or <see langword="null"/> if no
-    /// send was ever queued with this tag, or its status has since been forgotten (see <see
-    /// cref="GetStatus"/>).
-    /// </summary>
-    /// <param name="tag">The tag identifying the send to look up, as passed to <see cref="Send(IMemoryOwner{byte}, MsmtSendOptions?, CancellationToken)"/>.</param>
-    public IMsmtPackage? GetPackage(object tag) =>
-        sendStatuses.TryGetValue(tag, out MsmtSendStatus status) ? new MsmtPackage(this, tag, status) : null;
+    public MsmtSendStatus? GetStatus(object tag) => tracker.GetStatus(tag);
 
     /// <summary>
     /// Immediately abandons this client: cancels its background loops and closes its connection without
@@ -247,10 +240,14 @@ internal sealed class MsmtClient : IMsmtLink
     /// </summary>
     public void Dispose()
     {
+        if (!MarkDisposed())
+        {
+            return;
+        }
+
         disposalCancellation.Cancel();
         DrainQueueOnShutdown();
         CloseConnection();
-        disposalCancellation.Dispose();
     }
 
     /// <summary>
@@ -262,6 +259,11 @@ internal sealed class MsmtClient : IMsmtLink
     /// <returns>A task that completes once the shutdown has finished.</returns>
     public async ValueTask DisposeAsync()
     {
+        if (!MarkDisposed())
+        {
+            return;
+        }
+
         await disposalCancellation.CancelAsync();
 
         // BouncyCastle's TLS stream falls back to a blocking byte[]-based ReadAsync overload it never
@@ -283,11 +285,11 @@ internal sealed class MsmtClient : IMsmtLink
             }
         }
 
-        if (keepAliveLoop is not null)
+        if (maintenanceLoop is not null)
         {
             try
             {
-                await keepAliveLoop;
+                await maintenanceLoop;
             }
             catch (OperationCanceledException)
             {
@@ -296,23 +298,42 @@ internal sealed class MsmtClient : IMsmtLink
 
         DrainQueueOnShutdown();
         CloseConnection();
-        disposalCancellation.Dispose();
-        queueSignal.Dispose();
+    }
+
+    /// <summary>
+    /// Marks this client disposed under the queue lock, so every <see cref="Enqueue"/> either lands before
+    /// this (and is drained by shutdown) or is refused.
+    /// </summary>
+    /// <returns><see langword="true"/> if this call marked it; <see langword="false"/> if it was already disposed.</returns>
+    private bool MarkDisposed()
+    {
+        lock (queueLock)
+        {
+            if (isDisposed)
+            {
+                return false;
+            }
+
+            isDisposed = true;
+            return true;
+        }
     }
 
     /// <summary>Immediately closes the underlying socket, if any, without touching <see cref="MsmtClient"/>'s own connection bookkeeping.</summary>
-    private void ForceCloseSocket()
+    private void ForceCloseSocket() => CloseSocket(tcpClient);
+
+    private void CloseSocket(TcpClient? client)
     {
         try
         {
-            tcpClient?.Close();
+            client?.Close();
         }
         catch (Exception exception) when (exception is IOException or ObjectDisposedException)
         {
         }
     }
 
-    private void Enqueue(IMemoryOwner<byte> payload, MsmtMessageFlags flags, object? tag, int priority, int? dscp, CancellationToken cancellation, TaskCompletionSource<MsmtResponse>? responseSource, bool isIdleCheck = false)
+    private bool Enqueue(IMemoryOwner<byte> payload, MsmtMessageFlags flags, object? tag, int priority, int? dscp, CancellationToken cancellation, TaskCompletionSource<MsmtResponse>? responseSource, PendingKind kind = PendingKind.Message)
     {
         PendingSend item = new()
         {
@@ -322,21 +343,31 @@ internal sealed class MsmtClient : IMsmtLink
             Dscp = dscp,
             Cancellation = cancellation,
             ResponseSource = responseSource,
-            IsIdleCheck = isIdleCheck,
+            Kind = kind,
         };
-
-        if (tag is not null)
-        {
-            activeSends[tag] = item;
-        }
-
-        // Counts this item as outstanding until it finishes processing (see HandleIdleCheck/SendOverConnection),
-        // so MaxIdleTime/MaxConnectionCount eviction (IsIdle) never targets a connection with a send still
-        // queued or in flight.
-        Interlocked.Increment(ref outstandingSends);
 
         lock (queueLock)
         {
+            if (isDisposed)
+            {
+                item.CancelSource.Dispose();
+                return false;
+            }
+
+            if (tag is not null)
+            {
+                // A send may be queued before Connect supplies the target; its package then reports an empty one.
+                tracker.Begin(tag, ((MsmtConnectOptions?)options)?.Target ?? unconnectedTarget, item.CancelSource);
+            }
+
+            // Counts a send as outstanding until it finishes processing (see SendOverConnection), so idle
+            // eviction (IsIdle) never targets a client with a send still queued or in flight. Maintenance
+            // is not traffic, so it never keeps a client from counting as idle.
+            if (kind == PendingKind.Message)
+            {
+                Interlocked.Increment(ref outstandingSends);
+            }
+
             queue.Enqueue(item, (-priority, sendSequence++));
         }
 
@@ -344,6 +375,7 @@ internal sealed class MsmtClient : IMsmtLink
         // process (and report further status for) this item before its Queued status has been observed.
         RaisePackageChanged(tag, MsmtSendStatus.Queued);
         queueSignal.Release();
+        return true;
     }
 
     private async Task ProcessQueueLoop()
@@ -371,9 +403,9 @@ internal sealed class MsmtClient : IMsmtLink
                 continue;
             }
 
-            if (item.IsIdleCheck)
+            if (item.Kind == PendingKind.Maintenance)
             {
-                HandleIdleCheck(item);
+                HandleMaintenance(item);
                 continue;
             }
 
@@ -427,104 +459,152 @@ internal sealed class MsmtClient : IMsmtLink
             RaisePackageChanged(item.Tag, MsmtSendStatus.Cancelled);
             item.ResponseSource?.TrySetCanceled();
             item.CancelSource.Dispose();
-            Interlocked.Decrement(ref outstandingSends);
+
+            if (item.Kind == PendingKind.Message)
+            {
+                Interlocked.Decrement(ref outstandingSends);
+            }
         }
     }
 
     /// <summary>
-    /// Closes this client's connection if it has gone <see cref="MsmtConnectOptions.MaxIdleTime"/> without a
-    /// send, run as a queued item so it never races a concurrently processed real send for the same
-    /// connection - by the time this runs, nothing else is mid-cycle. If the connection is still open but
-    /// not yet actually idle that long - including because <see cref="ScheduleIdleCheck"/> clamped the wait
-    /// short of the full configured duration - reschedules another check for whatever time remains.
+    /// Runs a maintenance check as a queued item, so it never races a concurrently processed send for the
+    /// same connection - by the time this runs, nothing else is mid-cycle. Closes a <see
+    /// cref="MsmtOperationMode.Session"/> connection whose negotiated lifetime has ended, or one the remote
+    /// peer closed while it sat idle (raising <see cref="Unlinked"/> promptly instead of only when the next
+    /// send fails), and otherwise queues a keep-alive once a Session connection has been silent for its
+    /// randomized interval.
     /// </summary>
-    /// <param name="item">The idle-check placeholder item to dispose of once handled.</param>
-    private void HandleIdleCheck(PendingSend item)
+    /// <param name="item">The maintenance placeholder item to dispose of once handled.</param>
+    private void HandleMaintenance(PendingSend item)
     {
         try
         {
-            // Consumed here regardless of outcome: ScheduleIdleCheck below re-arms it if rescheduling, and
-            // there's nothing left to debounce against once this connection is closing or already closed.
-            Interlocked.Exchange(ref idleCheckScheduled, 0);
+            Interlocked.Exchange(ref maintenanceQueued, 0);
 
-            if (connection is null || options.MaxIdleTime is not { } maxIdleTime)
+            if (connection is null)
             {
                 return;
             }
 
-            TimeSpan remaining = maxIdleTime - (DateTime.UtcNow - LastActivityUtc);
-            if (remaining <= TimeSpan.Zero)
+            DateTime now = DateTime.UtcNow;
+
+            if (options.Mode == MsmtOperationMode.Session && now >= sessionExpiresAtUtc)
             {
                 CloseConnection();
             }
-            else
+            else if (!IsSocketAlive())
             {
-                ScheduleIdleCheck(remaining);
+                CloseConnection(new IOException("The remote peer closed the connection while it was idle."));
             }
-        }
-        finally
-        {
-            item.Payload.Dispose();
-            item.CancelSource.Dispose();
-            Interlocked.Decrement(ref outstandingSends);
-        }
-    }
-
-    private async Task KeepAliveLoop()
-    {
-        using PeriodicTimer timer = new(keepAliveCheckInterval);
-        while (await timer.WaitForNextTickAsync(disposalCancellation.Token))
-        {
-            bool sessionIdle =
-                options.Mode == MsmtOperationMode.Session
-                && connection is not null
-                && DateTime.UtcNow < sessionExpiresAtUtc
-                && DateTime.UtcNow - LastActivityUtc >= keepAliveInterval;
-
-            if (sessionIdle)
+            else if (options.Mode == MsmtOperationMode.Session && now - new DateTime(Interlocked.Read(ref lastWireActivityTicks), DateTimeKind.Utc) >= keepAliveInterval)
             {
                 Enqueue(EmptyMemoryOwner.Instance, MsmtMessageFlags.ReachabilityCheck, null, 0, null, disposalCancellation.Token, null);
             }
         }
+        finally
+        {
+            item.CancelSource.Dispose();
+        }
+    }
+
+    private async Task MaintenanceLoop()
+    {
+        using PeriodicTimer timer = new(maintenanceInterval);
+        while (await timer.WaitForNextTickAsync(disposalCancellation.Token))
+        {
+            if (connection is not null && Interlocked.CompareExchange(ref maintenanceQueued, 1, 0) == 0)
+            {
+                Enqueue(EmptyMemoryOwner.Instance, MsmtMessageFlags.None, null, 0, null, disposalCancellation.Token, null, PendingKind.Maintenance);
+            }
+        }
     }
 
     /// <summary>
-    /// Schedules a one-shot check, at most <paramref name="delay"/> from now (see <see
-    /// cref="MsmtProtocol.ClampToMaxTimerDuration"/>), of whether this client's connection has since gone
-    /// idle - queued rather than run directly on this timer, so it can never race a concurrently processed
-    /// send for the same connection (see <see cref="HandleIdleCheck"/>). A no-op if a check is already
-    /// scheduled, since that one will reschedule itself for the correct remaining time if it turns out to
-    /// still be too early once it runs.
+    /// Determines whether the remote peer has left the connection open. This client never reads while
+    /// idle, so a closed or reset connection would otherwise go unnoticed until the next send failed on it.
+    /// A socket that is readable with nothing to read has been closed by the peer; unread bytes count as
+    /// alive, since they may be a TLS message rather than the end of the stream.
     /// </summary>
-    /// <param name="delay">How long from now to check, at most.</param>
-    private void ScheduleIdleCheck(TimeSpan delay)
+    /// <returns><see langword="false"/> if the connection is known to be closed.</returns>
+    private bool IsSocketAlive()
     {
-        if (Interlocked.CompareExchange(ref idleCheckScheduled, 1, 0) != 0)
+        Socket? socket = tcpClient?.Client;
+        if (socket is null)
         {
-            return;
+            return false;
         }
 
-        TimeSpan clampedDelay = MsmtProtocol.ClampToMaxTimerDuration(delay);
-        _ = Task.Run(async () =>
+        try
         {
-            try
-            {
-                await Task.Delay(clampedDelay, disposalCancellation.Token);
-            }
-            catch (OperationCanceledException)
-            {
-                return;
-            }
+            return !socket.Poll(0, SelectMode.SelectError) && !(socket.Poll(0, SelectMode.SelectRead) && socket.Available == 0);
+        }
+        catch (Exception exception) when (exception is SocketException or ObjectDisposedException)
+        {
+            return false;
+        }
+    }
 
-            try
+    private Exception TranslateFailure(Exception exception, CancellationToken cancellation, MsmtWatchdog? connectionWatchdog)
+    {
+        if (exception is OperationCanceledException or TimeoutException)
+        {
+            return exception;
+        }
+
+        // A forced socket close (via the cancellation registration or a watchdog) surfaces as a generic
+        // IOException/ObjectDisposedException from the handshake or stream, since BouncyCastle doesn't honor
+        // cancellation tokens once blocked - report what actually caused it instead of a confusing
+        // "connection closed" error.
+        if (cancellation.IsCancellationRequested)
+        {
+            return new OperationCanceledException("The send was cancelled.", exception, cancellation);
+        }
+
+        return connectionWatchdog is { HasExpired: true }
+            ? new TimeoutException("The remote peer did not respond within the configured timeout.", exception)
+            : exception;
+    }
+
+    private Exception CloseAfterFailure(Exception exception, CancellationToken cancellation, MsmtWatchdog? connectionWatchdog)
+    {
+        Exception failure = TranslateFailure(exception, cancellation, connectionWatchdog);
+        CloseConnection(failure is TimeoutException ? failure : exception);
+        return failure;
+    }
+
+    private async Task<(MsmtHeader Header, IMemoryOwner<byte> Payload)> Exchange(Stream stream, MsmtWatchdog connectionWatchdog, MsmtHeader requestHeader, ReadOnlyMemory<byte> requestPayload, string mismatchMessage, Action? onRequestWritten, CancellationToken cancellation)
+    {
+        byte[] headerBuffer = new byte[MsmtHeader.Size];
+        requestHeader.Write(headerBuffer);
+
+        using (connectionWatchdog.Guard(options.StallTimeout, true))
+        {
+            await stream.WriteAsync(headerBuffer, cancellation);
+            if (requestPayload.Length > 0)
             {
-                Enqueue(EmptyMemoryOwner.Instance, MsmtMessageFlags.None, null, 0, null, disposalCancellation.Token, null, isIdleCheck: true);
+                await stream.WriteAsync(requestPayload, cancellation);
             }
-            catch (ObjectDisposedException)
-            {
-                // Raced this client's own disposal completing (queueSignal already disposed); nothing left to check.
-            }
-        });
+        }
+
+        onRequestWritten?.Invoke();
+
+        MsmtHeader responseHeader;
+        using (connectionWatchdog.Guard(options.ResponseTimeout, false))
+        {
+            await MsmtProtocol.ReadExact(stream, headerBuffer, cancellation);
+            responseHeader = MsmtHeader.Read(headerBuffer);
+        }
+
+        if (!responseHeader.IsWellFormed() || !responseHeader.Acknowledges(requestHeader))
+        {
+            throw new InvalidOperationException(mismatchMessage);
+        }
+
+        using (connectionWatchdog.Guard(options.StallTimeout, true))
+        {
+            return (responseHeader, await MsmtProtocol.ReadPooled(stream, (int)responseHeader.Length, cancellation));
+        }
     }
 
     private async Task SendOverConnection(PendingSend item)
@@ -540,12 +620,14 @@ internal sealed class MsmtClient : IMsmtLink
         // here takes effect promptly instead of leaving the send blocked indefinitely.
         using CancellationTokenRegistration forceCloseOnCancellation = cancellation.Register(ForceCloseSocket);
 
+        bool isKeepAlive = (item.Flags & MsmtMessageFlags.ReachabilityCheck) == MsmtMessageFlags.ReachabilityCheck;
+
         try
         {
             try
             {
                 RekeyableTlsClientProtocol protocol = await EnsureConnection(cancellation);
-                Stream stream = protocol.Stream;
+                MsmtWatchdog connectionWatchdog = watchdog!;
 
                 if (item.Dscp is { } dscp)
                 {
@@ -567,44 +649,25 @@ internal sealed class MsmtClient : IMsmtLink
                 {
                     RaisePackageChanged(item.Tag, MsmtSendStatus.Transmitting);
 
-                    byte[] headerBuffer = new byte[MsmtHeader.Size];
-                    requestHeader.Write(headerBuffer);
-                    await stream.WriteAsync(headerBuffer, cancellation);
-                    if (item.Payload.Memory.Length > 0)
+                    void OnRequestWritten()
                     {
-                        await stream.WriteAsync(item.Payload.Memory, cancellation);
+                        if ((item.Flags & MsmtMessageFlags.AcknowledgementRequestedOrGiven) == MsmtMessageFlags.AcknowledgementRequestedOrGiven)
+                        {
+                            RaisePackageChanged(item.Tag, MsmtSendStatus.PendingAcknowledgement);
+                        }
                     }
 
-                    if ((item.Flags & MsmtMessageFlags.AcknowledgementRequestedOrGiven) == MsmtMessageFlags.AcknowledgementRequestedOrGiven)
-                    {
-                        RaisePackageChanged(item.Tag, MsmtSendStatus.PendingAcknowledgement);
-                    }
-
-                    await MsmtProtocol.ReadExact(stream, headerBuffer, cancellation);
-                    responseHeader = MsmtHeader.Read(headerBuffer);
-
-                    if (!responseHeader.IsWellFormed() || !responseHeader.Acknowledges(requestHeader))
-                    {
-                        throw new InvalidOperationException("The server's acknowledgement did not correspond to the sent message.");
-                    }
-
-                    responsePayload = await MsmtProtocol.ReadPooled(stream, (int)responseHeader.Length, cancellation);
+                    (responseHeader, responsePayload) = await Exchange(protocol.Stream, connectionWatchdog, requestHeader, item.Payload.Memory, "The server's acknowledgement did not correspond to the sent message.", OnRequestWritten, cancellation);
                 }
                 catch (Exception exception)
                 {
-                    CloseConnection(exception);
-
-                    // A forced socket close (via the cancellation registration above) surfaces as a generic
-                    // IOException/ObjectDisposedException from the stream, not OperationCanceledException,
-                    // since BouncyCastle's TLS stream doesn't honor cancellation tokens on a blocked
-                    // read/write - report it as a cancellation instead of a confusing "connection closed"
-                    // error whenever cancellation is what actually triggered it.
-                    if (cancellation.IsCancellationRequested)
+                    Exception failure = CloseAfterFailure(exception, cancellation, connectionWatchdog);
+                    if (ReferenceEquals(failure, exception))
                     {
-                        throw new OperationCanceledException("The send was cancelled.", exception, cancellation);
+                        throw;
                     }
 
-                    throw;
+                    throw failure;
                 }
 
                 bool success = (responseHeader.Flags & MsmtMessageFlags.MessageSuccess) == MsmtMessageFlags.MessageSuccess;
@@ -619,7 +682,13 @@ internal sealed class MsmtClient : IMsmtLink
                 }
 
                 messagesSinceConnect++;
-                Interlocked.Exchange(ref lastActivityTicks, DateTime.UtcNow.Ticks);
+                long completedTicks = DateTime.UtcNow.Ticks;
+                Interlocked.Exchange(ref lastWireActivityTicks, completedTicks);
+
+                if (!isKeepAlive)
+                {
+                    Interlocked.Exchange(ref lastActivityTicks, completedTicks);
+                }
 
                 if (options.Mode == MsmtOperationMode.Message)
                 {
@@ -644,13 +713,10 @@ internal sealed class MsmtClient : IMsmtLink
                         }
                     }
                 }
-
-                // No-op for Message Mode, which already closed the connection above - there is nothing left
-                // to time out until the next send opens a fresh one.
-                if (connection is not null && options.MaxIdleTime is { } maxIdleTime)
-                {
-                    ScheduleIdleCheck(maxIdleTime);
-                }
+            }
+            catch (Exception exception) when (exception is not OperationCanceledException && cancellation.IsCancellationRequested)
+            {
+                throw new OperationCanceledException("The send was cancelled.", exception, cancellation);
             }
             finally
             {
@@ -669,26 +735,30 @@ internal sealed class MsmtClient : IMsmtLink
     {
         if (connection is not null)
         {
-            if (options.Mode == MsmtOperationMode.MessageWithRekeying)
-            {
-                return connection;
-            }
+            bool isReusable = options.Mode == MsmtOperationMode.MessageWithRekeying
+                || (options.Mode == MsmtOperationMode.Session && DateTime.UtcNow < sessionExpiresAtUtc);
 
-            if (options.Mode == MsmtOperationMode.Session && DateTime.UtcNow < sessionExpiresAtUtc)
+            if (isReusable)
             {
-                return connection;
+                if (IsSocketAlive())
+                {
+                    return connection;
+                }
+
+                // Nothing has been written to it yet, so the send can safely proceed over a fresh connection.
+                CloseConnection(new IOException("The remote peer closed the connection while it was idle."));
             }
         }
 
         CloseConnection();
-        Linking.Invoke(this, new MsmtLinkingEventArgs { Link = this });
         RekeyableTlsClientProtocol protocol;
 
         try
         {
+            Linking.Invoke(this, new MsmtLinkingEventArgs { Link = this });
             protocol = await OpenConnection(cancellation);
         }
-        catch (Exception exception) when (exception is not OperationCanceledException)
+        catch (Exception exception)
         {
             CloseConnection();
             LinkFailed.Invoke(this, new MsmtLinkFailedEventArgs { Link = this, Exception = exception });
@@ -700,18 +770,25 @@ internal sealed class MsmtClient : IMsmtLink
 
         if (options.Mode == MsmtOperationMode.Session)
         {
+            MsmtWatchdog connectionWatchdog = watchdog!;
+
             try
             {
-                sessionExpiresAtUtc = await NegotiateSession(protocol, cancellation);
+                sessionExpiresAtUtc = await NegotiateSession(protocol, connectionWatchdog, cancellation);
             }
             catch (Exception exception)
             {
-                CloseConnection(exception);
-                throw;
+                Exception failure = CloseAfterFailure(exception, cancellation, connectionWatchdog);
+                if (ReferenceEquals(failure, exception))
+                {
+                    throw;
+                }
+
+                throw failure;
             }
 
-            keepAliveInterval = TimeSpan.FromSeconds(keepAliveRandom.Next(180, 301));
-            Interlocked.Exchange(ref lastActivityTicks, DateTime.UtcNow.Ticks);
+            keepAliveInterval = options.KeepAliveMinInterval + ((options.KeepAliveMaxInterval - options.KeepAliveMinInterval) * keepAliveRandom.NextDouble());
+            Interlocked.Exchange(ref lastWireActivityTicks, DateTime.UtcNow.Ticks);
         }
 
         return protocol;
@@ -720,15 +797,29 @@ internal sealed class MsmtClient : IMsmtLink
     private async Task<RekeyableTlsClientProtocol> OpenConnection(CancellationToken cancellation)
     {
         TcpClient client = new();
+        MsmtWatchdog connectionWatchdog = new(() => CloseSocket(client));
         tcpClient = client;
-        await client.ConnectAsync(options.Target.Host, options.Target.Port, cancellation);
+        watchdog = connectionWatchdog;
 
-        RekeyableTlsClientProtocol protocol = new(client.GetStream());
-        MsmtTlsClient tlsClient = new(options);
-        protocol.Connect(tlsClient);
-        remoteIdentity = tlsClient.ServerIdentity;
-        messagesSinceConnect = 0;
-        return protocol;
+        try
+        {
+            using (connectionWatchdog.Guard(options.HandshakeTimeout, false))
+            {
+                await client.ConnectAsync(options.Target.Host, options.Target.Port, cancellation);
+                MsmtProtocol.ApplyTcpKeepAlive(client.Client, options.TcpKeepAliveTime);
+
+                RekeyableTlsClientProtocol protocol = new(new MsmtWatchedStream(client.GetStream(), connectionWatchdog));
+                MsmtTlsClient tlsClient = new(options);
+                protocol.Connect(tlsClient);
+                remoteIdentity = tlsClient.ServerIdentity;
+                messagesSinceConnect = 0;
+                return protocol;
+            }
+        }
+        catch (Exception exception) when (exception is not (OperationCanceledException or TimeoutException) && connectionWatchdog.HasExpired)
+        {
+            throw new TimeoutException("The connection did not complete its handshake within the configured timeout.", exception);
+        }
     }
 
     // Applied per send rather than once per connection, since a cached connection (Session Mode or
@@ -748,10 +839,10 @@ internal sealed class MsmtClient : IMsmtLink
         }
     }
 
-    private async Task<DateTime> NegotiateSession(RekeyableTlsClientProtocol protocol, CancellationToken cancellation)
+    private async Task<DateTime> NegotiateSession(RekeyableTlsClientProtocol protocol, MsmtWatchdog connectionWatchdog, CancellationToken cancellation)
     {
-        Stream stream = protocol.Stream;
         byte[] payload = Encoding.ASCII.GetBytes(((int)options.SessionLifetime.TotalSeconds).ToString(CultureInfo.InvariantCulture));
+        const string mismatchMessage = "The server's session negotiation reply did not correspond to the sent request.";
 
         MsmtHeader requestHeader = new()
         {
@@ -761,60 +852,31 @@ internal sealed class MsmtClient : IMsmtLink
             Length = (uint)payload.Length,
         };
 
-        byte[] headerBuffer = new byte[MsmtHeader.Size];
-        requestHeader.Write(headerBuffer);
-        await stream.WriteAsync(headerBuffer, cancellation);
-        await stream.WriteAsync(payload, cancellation);
+        (MsmtHeader responseHeader, IMemoryOwner<byte> responsePayload) = await Exchange(protocol.Stream, connectionWatchdog, requestHeader, payload, mismatchMessage, null, cancellation);
 
-        await MsmtProtocol.ReadExact(stream, headerBuffer, cancellation);
-        MsmtHeader responseHeader = MsmtHeader.Read(headerBuffer);
-
-        if (!responseHeader.IsWellFormed() || !responseHeader.Acknowledges(requestHeader) || (responseHeader.Flags & MsmtMessageFlags.SessionModeNegotiation) == 0)
+        using (responsePayload)
         {
-            throw new InvalidOperationException("The server's session negotiation reply did not correspond to the sent request.");
-        }
+            if ((responseHeader.Flags & MsmtMessageFlags.SessionModeNegotiation) == 0)
+            {
+                throw new InvalidOperationException(mismatchMessage);
+            }
 
-        byte[] responsePayload = [];
-        if (responseHeader.Length > 0)
-        {
-            responsePayload = new byte[responseHeader.Length];
-            await MsmtProtocol.ReadExact(stream, responsePayload, cancellation);
-        }
+            if (responseHeader.Flags != MsmtMessageFlags.SessionModeAccepted)
+            {
+                throw new InvalidOperationException("The remote MSMT server rejected or does not support Session Mode.");
+            }
 
-        if (responseHeader.Flags != MsmtMessageFlags.SessionModeAccepted)
-        {
-            throw new InvalidOperationException("The remote MSMT server rejected or does not support Session Mode.");
+            int agreedSeconds = int.Parse(Encoding.ASCII.GetString(responsePayload.Memory.Span), CultureInfo.InvariantCulture);
+            return DateTime.UtcNow.AddSeconds(agreedSeconds);
         }
-
-        int agreedSeconds = int.Parse(Encoding.ASCII.GetString(responsePayload), CultureInfo.InvariantCulture);
-        return DateTime.UtcNow.AddSeconds(agreedSeconds);
     }
 
     private void RaisePackageChanged(object? tag, MsmtSendStatus status)
     {
-        if (tag is null)
+        if (tag is not null && tracker.SetStatus(tag, status) is { } package)
         {
-            return;
+            PackageChanged.Invoke(this, new MsmtPackageChangedEventArgs { Link = this, Package = package, Status = status });
         }
-
-        sendStatuses[tag] = status;
-
-        if (status is MsmtSendStatus.Completed or MsmtSendStatus.Cancelled)
-        {
-            activeSends.TryRemove(tag, out _);
-
-            // Bounds otherwise-unbounded growth of sendStatuses for a long-lived client given a uniquely
-            // tagged send per message: only a completed/cancelled tag - never one still active - is queued
-            // for eventual eviction, so GetStatus keeps working for every in-flight or recently finished
-            // send and only forgets a tag once far enough behind more recent completions.
-            completedSendTags.Enqueue(tag);
-            while (completedSendTags.Count > maxTrackedCompletedSendStatuses && completedSendTags.TryDequeue(out object? oldestTag))
-            {
-                sendStatuses.TryRemove(oldestTag, out _);
-            }
-        }
-
-        PackageChanged.Invoke(this, new MsmtPackageChangedEventArgs { Link = this, Package = new MsmtPackage(this, tag, status), Status = status });
     }
 
     private void CloseConnection(Exception? exception = null)
@@ -822,22 +884,29 @@ internal sealed class MsmtClient : IMsmtLink
         // Only a connection that was fully established and secured (Linked already raised for it) ever
         // raises Unlinked; a failed attempt that never got that far raises LinkFailed instead, at its own
         // call site, since there is no established connection here to surface.
-        if (connection is not null)
+        // Exchanged atomically since Dispose may run this concurrently with the processing loop, and each
+        // established connection must raise Unlinked exactly once.
+        if (Interlocked.Exchange(ref connection, null) is { } closing)
         {
             try
             {
-                connection.Close();
+                closing.Close();
             }
             catch (IOException)
             {
             }
 
-            connection = null;
             Unlinked.Invoke(this, new MsmtUnlinkedEventArgs { Link = this, Exception = exception });
         }
 
-        tcpClient?.Dispose();
-        tcpClient = null;
+        Interlocked.Exchange(ref tcpClient, null)?.Dispose();
+        Interlocked.Exchange(ref watchdog, null)?.Dispose();
+    }
+
+    private enum PendingKind
+    {
+        Message,
+        Maintenance,
     }
 
     private sealed record PendingSend
@@ -854,7 +923,7 @@ internal sealed class MsmtClient : IMsmtLink
 
         public TaskCompletionSource<MsmtResponse>? ResponseSource { get; init; }
 
-        public bool IsIdleCheck { get; init; }
+        public PendingKind Kind { get; init; }
 
         public CancellationTokenSource CancelSource { get; } = new();
     }

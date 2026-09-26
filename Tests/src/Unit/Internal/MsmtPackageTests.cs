@@ -3,69 +3,74 @@ namespace BlueHeighliner.Msmt.Tests.Unit.Internal;
 /// <summary>Unit tests for <see cref="MsmtPackage"/>.</summary>
 public sealed class MsmtPackageTests
 {
-    /// <summary><see cref="MsmtPackage.Tag"/> returns the tag it was constructed with.</summary>
+    private readonly MsmtNameTarget target = new() { Host = "127.0.0.1", Port = 5000, ServerName = "127.0.0.1" };
+
+    /// <summary><see cref="MsmtPackage.Tag"/> and <see cref="MsmtPackage.Target"/> return what it was constructed with.</summary>
     [Fact]
-    public async Task Tag_Constructed_ReturnsGivenTag()
+    public void TagAndTarget_Constructed_ReturnGivenValues()
     {
         object tag = new();
-        await using MsmtClient client = new();
 
-        MsmtPackage package = new(client, tag, MsmtSendStatus.Queued);
+        MsmtPackage package = new(new Mock<IMsmtPackageTracker>().Object, tag, target, MsmtSendStatus.Queued);
 
         Assert.Same(tag, package.Tag);
-    }
-
-    /// <summary><see cref="MsmtPackage.Target"/> reflects the owning client's target.</summary>
-    [Fact]
-    public async Task Target_Constructed_ReflectsClientTarget()
-    {
-        (X509Certificate2 certificate, _, X509Certificate2Collection trustedAuthorities) = TestMsmtCertificates.Create();
-        MsmtNameTarget target = new() { Host = "127.0.0.1", Port = 5000, ServerName = "127.0.0.1" };
-        await using MsmtClient client = new();
-        await client.Connect(new MsmtConnectOptions { Target = target, Credentials = new MsmtCredentials { Identity = certificate, TrustedAuthorities = trustedAuthorities } });
-
-        MsmtPackage package = new(client, new object(), MsmtSendStatus.Queued);
-
         Assert.Equal(target, package.Target);
     }
 
-    /// <summary>A final <see cref="MsmtSendStatus"/> (<see cref="MsmtSendStatus.Completed"/>/<see cref="MsmtSendStatus.Cancelled"/>) given at construction is latched and returned without ever consulting the client again.</summary>
+    /// <summary>A final <see cref="MsmtSendStatus"/> given at construction is latched and returned without ever consulting the tracker again.</summary>
     [Theory]
     [InlineData(MsmtSendStatus.Completed)]
     [InlineData(MsmtSendStatus.Cancelled)]
-    public async Task Status_ConstructedWithFinalStatus_ReturnsItWithoutConsultingClient(MsmtSendStatus finalStatus)
+    public void Status_ConstructedWithFinalStatus_ReturnsItWithoutConsultingTracker(MsmtSendStatus finalStatus)
     {
-        await using MsmtClient client = new();
+        Mock<IMsmtPackageTracker> tracker = new();
         object tag = new();
 
-        MsmtPackage package = new(client, tag, finalStatus);
+        MsmtPackage package = new(tracker.Object, tag, target, finalStatus);
 
         Assert.Equal(finalStatus, package.Status);
-        // The client never tracked this tag at all - if Status incorrectly re-consulted it, GetStatus's
-        // null result would have no effect anyway, so this also confirms the latch by construction.
-        Assert.Null(client.GetStatus(tag));
+        tracker.Verify(instance => instance.GetStatus(It.IsAny<object>()), Times.Never);
     }
 
-    /// <summary>A non-final status re-reads the client's current status on every access, keeping the last known non-final value when the client no longer tracks the tag.</summary>
+    /// <summary>A non-final status re-reads the tracker's current status on every access, and latches once it becomes final.</summary>
     [Fact]
-    public async Task Status_ConstructedWithNonFinalStatus_ReReadsClientOnEachAccess()
+    public void Status_ConstructedWithNonFinalStatus_ReReadsTrackerUntilFinal()
     {
-        await using MsmtClient client = new();
+        Mock<IMsmtPackageTracker> tracker = new();
+        object tag = new();
+        tracker.SetupSequence(instance => instance.GetStatus(tag))
+            .Returns(MsmtSendStatus.Transmitting)
+            .Returns(MsmtSendStatus.Completed);
+
+        MsmtPackage package = new(tracker.Object, tag, target, MsmtSendStatus.Queued);
+
+        Assert.Equal(MsmtSendStatus.Transmitting, package.Status);
+        Assert.Equal(MsmtSendStatus.Completed, package.Status);
+        Assert.Equal(MsmtSendStatus.Completed, package.Status);
+        tracker.Verify(instance => instance.GetStatus(tag), Times.Exactly(2));
+    }
+
+    /// <summary>A tag the tracker has forgotten keeps the last known non-final status.</summary>
+    [Fact]
+    public void Status_TrackerForgotTag_KeepsLastKnownStatus()
+    {
+        Mock<IMsmtPackageTracker> tracker = new();
+        tracker.Setup(instance => instance.GetStatus(It.IsAny<object>())).Returns((MsmtSendStatus?)null);
+
+        MsmtPackage package = new(tracker.Object, new object(), target, MsmtSendStatus.Queued);
+
+        Assert.Equal(MsmtSendStatus.Queued, package.Status);
+    }
+
+    /// <summary><see cref="MsmtPackage.Cancel"/> forwards to the tracker.</summary>
+    [Fact]
+    public void Cancel_Called_ForwardsToTracker()
+    {
+        Mock<IMsmtPackageTracker> tracker = new();
         object tag = new();
 
-        MsmtPackage package = new(client, tag, MsmtSendStatus.Queued);
+        new MsmtPackage(tracker.Object, tag, target, MsmtSendStatus.Queued).Cancel();
 
-        Assert.Equal(MsmtSendStatus.Queued, package.Status);
-        Assert.Equal(MsmtSendStatus.Queued, package.Status);
-    }
-
-    /// <summary><see cref="MsmtPackage.Cancel"/> forwards to the owning client's <see cref="MsmtClient.Cancel"/>, a no-op for a tag the client has no outstanding send for.</summary>
-    [Fact]
-    public async Task Cancel_NoOutstandingSendForTag_DoesNotThrow()
-    {
-        await using MsmtClient client = new();
-        MsmtPackage package = new(client, new object(), MsmtSendStatus.Queued);
-
-        Record.Exception(package.Cancel);
+        tracker.Verify(instance => instance.Cancel(tag), Times.Once);
     }
 }

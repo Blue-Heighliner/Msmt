@@ -28,13 +28,15 @@ internal sealed record MsmtHostOptions
     /// </summary>
     public bool RequireFullyQualifiedHostname { get; init; } = true;
 
-    /// <summary>
-    /// Gets the maximum time an accepted connection may go without a new message header arriving before it
-    /// is automatically disconnected, or <see langword="null"/> to disable this rule and never automatically
-    /// disconnect a connection for being idle. Never interrupts a message cycle already in progress - only
-    /// the gap between cycles counts as idle, so this has no practical effect on a <see
-    /// cref="MsmtOperationMode.Message"/> connection, which the client already closes immediately after
-    /// each cycle.
-    /// </summary>
-    public TimeSpan? MaxIdleTime { get; init; } = TimeSpan.FromMinutes(5);
+    /// <summary>Gets the number of messages an accepted connection that did not negotiate a <see cref="MsmtOperationMode.Session"/> serves before this server closes it.</summary>
+    public int RekeyLimit { get; init; } = 3;
+
+    /// <summary>Gets how long an accepted connection's TLS handshake, and then the wait for its first message, may take, or <see langword="null"/> for no limit.</summary>
+    public TimeSpan? HandshakeTimeout { get; init; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>Gets how long reading a message or writing its acknowledgement may make no progress before the connection is dropped, or <see langword="null"/> for no limit.</summary>
+    public TimeSpan? StallTimeout { get; init; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>Gets how long an accepted TCP connection may be silent before the operating system starts probing the remote host, or <see langword="null"/> to leave TCP keep-alive disabled.</summary>
+    public TimeSpan? TcpKeepAliveTime { get; init; } = TimeSpan.FromSeconds(60);
 }

@@ -22,12 +22,24 @@ ephemeral and essentially never equal to a port this peer separately dials out t
 applies whenever it does occur, e.g. once a peer's own request happens to originate from the exact port the
 other side later connects to.
 
-`MsmtConnection` exposes `EnsureSender`/`AttachReceiver`/`RemoveSender`/`RemoveReceiver`, called only by
-`MsmtPeer` as links connect and disconnect, to keep `SenderEngine`/`ReceiverEngine` in sync; a connection
-is removed from the registry (`RemoveConnectionIfEmpty`) once both are empty. `EnsureSender` uses a
-double-checked lock (`senderLock`) around the factory that builds a new `MsmtClient`, guaranteeing that
-factory - and so the client's background loops - runs exactly once per connection even under concurrent
-callers racing `Send`/`Request` for the same target.
+`MsmtConnection` exposes `ReserveSender`/`TryAttachReceiver`/`RemoveSender`/`RemoveIdleSender`/
+`RemoveReceiver`/`TryRetire`, called only by `MsmtPeer` as links connect and disconnect, to keep
+`SenderEngine`/`ReceiverEngine` in sync. All of them run under one lock (`stateLock`), which closes three
+races:
+
+- `ReserveSender` only runs the factory that builds a new `MsmtClient` if none exists, so that factory -
+  and so the client's background loops - runs exactly once per connection even under concurrent callers
+  racing `Send`/`Request` for the same target.
+- `ReserveSender` returns the client reserved (`MsmtClient.Reserve`), holding it non-idle until the caller
+  has queued its send and released the reservation, so eviction can't dispose it in between.
+- Once both engines are detached, `RemoveConnectionIfEmpty` retires the connection (`TryRetire`), after
+  which it refuses any further attach, and removes it from the registry by instance rather than by key. A
+  caller that finds a retired connection replaces it (`ReplaceRetiredConnection`) and retries, so no
+  engine is ever attached to a connection that is no longer registered.
+
+A caller can still `Drop`/`Disconnect` a connection between a send reserving its client and queuing on it;
+`Send`/`Request` then get an `ObjectDisposedException` before the payload is taken and retry a couple of
+times, each time against the fresh client the dropped one's removal from the pool allows.
 
 ## `Connected`/`Disconnected` bookkeeping
 
@@ -52,18 +64,24 @@ directly, letting a caller end just one direction without touching the other.
 
 ## Eviction
 
-`MsmtOptions.MaxConnectionCount` needs a cross-connection comparison to pick a victim, so `MsmtPeer` runs a
-background `EvictionLoop` task (a `PeriodicTimer` ticking every second) that enforces it independently for
-each direction: `EvictExcessSenders`/`EvictExcessReceivers` count all connections with a `SenderEngine`/
-`ReceiverEngine` respectively, and - only among the ones currently `IsIdle` - evict the oldest-activity
-excess via `EvictConnection`/`EvictReceiver`. Both re-check `IsIdle` immediately before evicting, since a
-candidate selected moments earlier may have started a cycle since. `EvictConnection` removes the client
-from the registry before awaiting its `DisposeAsync`, so a racing `Send` to the same target creates a
-fresh client rather than reusing one already being torn down; `EvictReceiver` just calls the accepted
-connection's own `Disconnect`, since - unlike a cached `MsmtClient` - its registry cleanup already happens
-reactively through the normal `Unlinked` event chain. This never interrupts a connection with a
-send/message cycle currently queued or in progress - each direction's own idle-detection (see the Sending
-and Receiving components) feeds `IsIdle`.
+`MsmtPeer` runs a background `EvictionLoop` task (a `PeriodicTimer` ticking every second) that enforces both
+pool policies independently for each direction. `MsmtOptions.MaxIdleTime` needs only each connection's own
+activity: `EvictUnusedSenders`/`EvictUnusedReceivers` evict any idle connection whose `LastActivityUtc` is
+older than the limit. `MaxConnectionCount` needs a cross-connection comparison to pick a victim:
+`EvictExcessSenders`/`EvictExcessReceivers` count all connections with a `SenderEngine`/`ReceiverEngine`
+respectively and, only among the ones currently `IsIdle`, evict the oldest-activity excess. Activity means
+application traffic only, so keep-alives never postpone either policy. Both re-check `IsIdle` immediately
+before evicting, since a candidate selected moments earlier may have started a cycle since.
+`EvictIdleSender` detaches the client via `RemoveIdleSender`, whose re-check (of both `IsIdle` and the
+minimum idle time) runs under the same lock as `ReserveSender`, before awaiting its `DisposeAsync`, so a
+racing `Send` to the same target either keeps it attached or creates a fresh client rather than reusing one
+being torn down. The whole pool entry is discarded, even a `Message` mode one with no open socket, along
+with its background loops; the peer's package tracker outlives it. A receiver is evicted by calling its own
+`Evict`, since - unlike a cached `MsmtClient` - its registry cleanup already happens reactively through the
+normal `Unlinked` event chain. A failure evicting one connection is swallowed rather than ending the loop,
+so eviction survives for the life of the peer. None of this interrupts a connection with a send/message
+cycle currently queued or in progress. The mechanisms that detect dropped or stalled connections, and bound a connection's
+lifetime, live in the connections themselves rather than in this loop.
 
 ## Disposal
 
@@ -72,14 +90,19 @@ immediately without waiting, then disposes the cancellation source. `DisposeAsyn
 awaits the eviction loop, then disposes every sender (awaited, one at a time) *before* disposing the
 server - in that order because a still-open link's read loop on the other side may only unblock once this
 side closes it, so closing this peer's own on-demand links first avoids it outliving links it could have
-released earlier.
+released earlier. Both are idempotent, and afterward `StartListener`/`Send`/`Request`/`Test` throw
+`ObjectDisposedException`. A `Send`/`Request` racing disposal that creates a sender after disposal has
+already swept the registry disposes that sender itself.
 
 ## Reachability check (`Test`)
 
 `IMsmtPeer.Test` bypasses `MsmtClient`/`MsmtServer` entirely: it opens its own raw `TlsClientProtocol` over
-a `TcpClient`, connects via `MsmtTlsClient`, writes a header with the `ReachabilityCheck` flag and a
-zero-length payload, reads back the acknowledgement, and returns whether it both `Acknowledges` the request
-and carries the same flag - then always closes the connection. This is a one-shot, connection-per-call
+a `TcpClient`, connects via `MsmtTlsClient` (on a thread-pool thread, since the handshake blocks), writes a
+header with the `ReachabilityCheck` flag and a zero-length payload, reads back the acknowledgement, and
+returns whether it both `Acknowledges` the request and carries the same flag - then always closes the
+connection. It runs under its own `MsmtWatchdog` with the same handshake, stall, and response timeouts as a
+normal send, reported as `TimeoutException`. Cancellation closes the socket, the only way to interrupt a
+blocked handshake or read, and is reported as `OperationCanceledException`. This is a one-shot, connection-per-call
 operation independent of `MsmtOptions.Mode`, matching the ICD's description of reachability checking as a
 standalone diagnostic rather than part of the normal send path. It is served on the remote side by the same
 generic `ReachabilityCheck`-flag handling in `MsmtServer`'s connection loop that also answers a
@@ -88,8 +111,10 @@ reachability-flagged message sent through the ordinary `MsmtClient` send path.
 ## Memory ownership
 
 Received payloads and response payloads are always rented from `MemoryPool<byte>.Shared`, delivered as an
-`IMemoryOwner<byte>` on `MsmtReceivedEventArgs.Payload`/`MsmtResponse.Payload`. Ownership transfers to
-whoever handles them, who must dispose it once done. `IMsmtPeer.Send`/`.Request` and
+`IMemoryOwner<byte>` on `MsmtReceivedEventArgs.Payload`/`MsmtResponse.Payload`. A response payload's
+ownership transfers to the `Request` caller, who must dispose it once done; a received payload is instead
+multicast to every `Received` subscriber, so `MsmtServer` keeps ownership and disposes it once they have
+all run. `IMsmtPeer.Send`/`.Request` and
 `IMsmtResponder.Accept`/`.Reject`'s `IMemoryOwner<byte>` overloads take ownership the same way - disposed
 once the send/acknowledgement completes, successfully or not. `NonOwningMemoryOwner` backs each type's
 `ReadOnlyMemory<byte>` overload, wrapping the input via `MemoryMarshal.AsMemory` with a no-op `Dispose()`,

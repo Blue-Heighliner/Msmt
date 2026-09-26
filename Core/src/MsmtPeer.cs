@@ -3,8 +3,9 @@ namespace BlueHeighliner.Msmt;
 /// <summary>
 /// A peer-to-peer MSMT API: internally manages one listener for incoming connections and a separate
 /// outgoing connection per remote target sent to, created on demand. Both directions are automatically
-/// disconnected in the background, independently of each other, once idle or once too many of that
-/// direction are open at once.
+/// disconnected in the background, independently of each other, once unused for too long or once too many
+/// of that direction are open at once. Connections that stall, drop, or outlive their negotiated lifetime
+/// are closed as well; see <see cref="MsmtOptions"/> for the timeouts involved.
 /// </summary>
 public interface IMsmtPeer : IAsyncDisposable, IDisposable
 {
@@ -73,7 +74,7 @@ public interface IMsmtPeer : IAsyncDisposable, IDisposable
     /// </summary>
     IReadOnlyList<IMsmtConnection> ActiveConnections { get; }
 
-    /// <summary>Gets a snapshot of this peer's currently active (not yet completed or cancelled) tagged packages, across every outgoing connection.</summary>
+    /// <summary>Gets a snapshot of this peer's currently active (not yet completed or cancelled) tagged packages, whichever outgoing connection carries them.</summary>
     IReadOnlyList<IMsmtPackage> Packages { get; }
 
     /// <summary>
@@ -82,6 +83,8 @@ public interface IMsmtPeer : IAsyncDisposable, IDisposable
     /// </summary>
     /// <param name="port">The local port to listen on. Defaults to <c>0</c> for an OS-assigned ephemeral port.</param>
     /// <param name="host">The local IP address or DNS hostname to listen on. Defaults to <c>0.0.0.0</c> (all interfaces).</param>
+    /// <exception cref="SocketException">The listening socket could not be bound; the peer is left not listening.</exception>
+    /// <exception cref="ObjectDisposedException">This peer has been disposed.</exception>
     void StartListener(int port = 0, string host = "0.0.0.0");
 
     /// <summary>Stops accepting new connections and immediately closes the listener.</summary>
@@ -103,6 +106,7 @@ public interface IMsmtPeer : IAsyncDisposable, IDisposable
     /// </param>
     /// <param name="options">Options governing how this payload is sent, or <see langword="null"/> to use the defaults.</param>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="payload"/> is longer than <see cref="MsmtLimits.MaxPayloadLength"/>.</exception>
+    /// <exception cref="ObjectDisposedException">This peer has been disposed.</exception>
     void Send(MsmtNameTarget target, IMemoryOwner<byte> payload, MsmtSendOptions? options = null);
 
     /// <summary>
@@ -121,14 +125,15 @@ public interface IMsmtPeer : IAsyncDisposable, IDisposable
     /// <param name="cancellation">Cancels the request before it completes.</param>
     /// <returns>The remote peer's acknowledgement.</returns>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="payload"/> is longer than <see cref="MsmtLimits.MaxPayloadLength"/>.</exception>
+    /// <exception cref="ObjectDisposedException">This peer has been disposed.</exception>
     Task<MsmtResponse> Request(MsmtNameTarget target, IMemoryOwner<byte> payload, MsmtSendOptions? options = null, CancellationToken cancellation = default);
 
     /// <summary>
     /// Gets the package for the tagged send previously queued via <see cref="Send"/> or <see cref="Request"/>
-    /// with <paramref name="tag"/>, across every outgoing connection. A completed or cancelled tag's package
-    /// is retained only for a bounded number of the most recently finished sends per connection, so this may
-    /// also return <see langword="null"/> for a tag whose send finished long enough ago to have been
-    /// forgotten.
+    /// with <paramref name="tag"/>. Tracked by the peer itself, so it keeps working after the outgoing
+    /// connection that carried the send has been disconnected and discarded. A completed or cancelled tag's
+    /// package is forgotten five minutes after the send finished, so this may also return <see
+    /// langword="null"/> for a tag whose send finished longer ago than that.
     /// </summary>
     /// <param name="tag">The tag identifying the send to look up, as passed to <see cref="Send"/> or <see cref="Request"/>.</param>
     /// <returns>The matching package, or <see langword="null"/> if no send was ever queued with this tag, or it has since been forgotten.</returns>
@@ -140,8 +145,11 @@ public interface IMsmtPeer : IAsyncDisposable, IDisposable
     /// correctly configured.
     /// </summary>
     /// <param name="target">The remote peer to check.</param>
-    /// <param name="cancellation">Cancels the check.</param>
+    /// <param name="cancellation">Cancels the check, interrupting a handshake or read already in progress.</param>
     /// <returns><see langword="true"/> if the remote peer responded successfully.</returns>
+    /// <exception cref="OperationCanceledException"><paramref name="cancellation"/> was cancelled.</exception>
+    /// <exception cref="TimeoutException">The remote peer did not complete the handshake, or acknowledge the check, within <see cref="MsmtOptions.HandshakeTimeout"/>, <see cref="MsmtOptions.StallTimeout"/>, or <see cref="MsmtOptions.ResponseTimeout"/>.</exception>
+    /// <exception cref="ObjectDisposedException">This peer has been disposed.</exception>
     Task<bool> Test(MsmtNameTarget target, CancellationToken cancellation = default);
 
     /// <summary>
@@ -168,7 +176,7 @@ public static class MsmtPeerExtensions
 {
     extension(IMsmtPeer peer)
     {
-        /// <summary>Gets a value indicating whether <see cref="IMsmtPeer.StartListener"/> has been called without a matching <see cref="IMsmtPeer.StopListener"/>.</summary>
+        /// <summary>Gets a value indicating whether <see cref="IMsmtPeer.StartListener"/> last succeeded, and neither <see cref="IMsmtPeer.StopListener"/> nor disposal has happened since.</summary>
         public bool IsListening => peer.Listener is not null;
 
         /// <summary>
@@ -183,6 +191,7 @@ public static class MsmtPeerExtensions
         /// </param>
         /// <param name="options">Options governing how this payload is sent, or <see langword="null"/> to use the defaults.</param>
         /// <exception cref="ArgumentOutOfRangeException"><paramref name="payload"/> is longer than <see cref="MsmtLimits.MaxPayloadLength"/>.</exception>
+        /// <exception cref="ObjectDisposedException">The peer has been disposed.</exception>
         public void Send(MsmtNameTarget target, ReadOnlyMemory<byte> payload, MsmtSendOptions? options = null) =>
             peer.Send(target, new NonOwningMemoryOwner(payload), options);
 
@@ -201,6 +210,7 @@ public static class MsmtPeerExtensions
         /// <param name="cancellation">Cancels the request before it completes.</param>
         /// <returns>The remote peer's acknowledgement.</returns>
         /// <exception cref="ArgumentOutOfRangeException"><paramref name="payload"/> is longer than <see cref="MsmtLimits.MaxPayloadLength"/>.</exception>
+        /// <exception cref="ObjectDisposedException">The peer has been disposed.</exception>
         public Task<MsmtResponse> Request(MsmtNameTarget target, ReadOnlyMemory<byte> payload, MsmtSendOptions? options = null, CancellationToken cancellation = default) =>
             peer.Request(target, new NonOwningMemoryOwner(payload), options, cancellation);
     }
