@@ -227,7 +227,13 @@ internal sealed class MsmtConnection : IMsmtConnection, IMsmtEvictable
     public async Task<bool> Ping(CancellationToken cancellation)
     {
         MsmtPendingSend send = new() { Payload = EmptyMemoryOwner.Instance, Flags = MsmtMessageFlags.ReachabilityCheck, Cancellation = cancellation, IsKeepAlive = true };
-        MsmtFrame response = (await Exchange(send, _ => { }, cancellation)).Value;
+
+        // IsKeepAlive always awaits a response (see Exchange), so this is never null.
+        if (await Exchange(send, _ => { }, cancellation) is not { } response)
+        {
+            throw new UnreachableException("A keep-alive exchange always returns a response.");
+        }
+
         using (response.Payload)
         {
             return (response.Header.Flags & MsmtMessageFlags.ReachabilityCheck) == MsmtMessageFlags.ReachabilityCheck;
