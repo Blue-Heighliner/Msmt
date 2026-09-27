@@ -21,22 +21,6 @@ public sealed class MsmtProtocolTests
         Assert.True(IPAddress.IsLoopback(address));
     }
 
-    /// <summary>A duration within <see cref="MsmtProtocol.MaxTimerDuration"/> passes through unchanged.</summary>
-    [Fact]
-    public void ClampToMaxTimerDuration_WithinLimit_ReturnsUnchanged()
-    {
-        TimeSpan duration = TimeSpan.FromSeconds(5);
-
-        Assert.Equal(duration, MsmtProtocol.ClampToMaxTimerDuration(duration));
-    }
-
-    /// <summary>A duration beyond <see cref="MsmtProtocol.MaxTimerDuration"/> is clamped down to it.</summary>
-    [Fact]
-    public void ClampToMaxTimerDuration_BeyondLimit_ClampsToMaxTimerDuration()
-    {
-        Assert.Equal(MsmtProtocol.MaxTimerDuration, MsmtProtocol.ClampToMaxTimerDuration(TimeSpan.MaxValue));
-    }
-
     /// <summary>A payload within <see cref="MsmtLimits.MaxPayloadLength"/> passes validation without throwing.</summary>
     [Fact]
     public void ValidatePayloadLength_WithinLimit_DoesNotThrow() =>
@@ -50,5 +34,19 @@ public sealed class MsmtProtocolTests
             () => MsmtProtocol.ValidatePayloadLength(MsmtLimits.MaxPayloadLength + 1, "payload"));
 
         Assert.Equal("payload", exception.ParamName);
+    }
+
+    /// <summary>TCP keep-alive is enabled on a socket when a time is given, and left alone when it is <see langword="null"/>.</summary>
+    [Fact]
+    public void ApplyTcpKeepAlive_TimeGivenOrNull_EnablesOrLeavesKeepAlive()
+    {
+        using Socket enabled = new(SocketType.Stream, ProtocolType.Tcp);
+        using Socket untouched = new(SocketType.Stream, ProtocolType.Tcp);
+
+        MsmtProtocol.ApplyTcpKeepAlive(enabled, TimeSpan.FromSeconds(30));
+        MsmtProtocol.ApplyTcpKeepAlive(untouched, null);
+
+        Assert.Equal(1, (int)enabled.GetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive)!);
+        Assert.Equal(0, (int)untouched.GetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive)!);
     }
 }

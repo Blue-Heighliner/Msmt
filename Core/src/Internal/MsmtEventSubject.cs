@@ -47,6 +47,7 @@ internal sealed class MsmtEventSubject<T> : IObservable<T>
 
     private sealed class Unsubscriber(MsmtEventSubject<T> subject, IObserver<T> observer) : IDisposable
     {
+        /// <inheritdoc />
         public void Dispose() => subject.Remove(observer);
     }
 }

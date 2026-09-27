@@ -52,6 +52,27 @@ public sealed class MsmtPackageTrackerTests
         Assert.False(cancelSource.IsCancellationRequested);
     }
 
+    /// <summary>A failed send is finished like a completed one: no longer active, no longer cancellable, and forgotten after the retention time.</summary>
+    [Fact]
+    public void SetStatus_Failed_IsFinishedAndEventuallyForgotten()
+    {
+        AdjustableTimeProvider time = new();
+        MsmtPackageTracker tracker = new(time: time);
+        object tag = new();
+        using CancellationTokenSource cancelSource = new();
+        tracker.Begin(tag, target, cancelSource);
+
+        IMsmtPackage? package = tracker.SetStatus(tag, MsmtSendStatus.Failed);
+        tracker.Cancel(tag);
+
+        Assert.Equal(MsmtSendStatus.Failed, package!.Status);
+        Assert.Empty(tracker.GetActivePackages());
+        Assert.False(cancelSource.IsCancellationRequested);
+
+        time.Advance(TimeSpan.FromMinutes(5));
+        Assert.Null(tracker.GetStatus(tag));
+    }
+
     /// <summary>Cancelling an active send cancels its source, and tolerates the source already being disposed.</summary>
     [Fact]
     public void Cancel_ActiveSend_CancelsItsSourceAndToleratesDisposal()

@@ -1,10 +1,13 @@
 namespace BlueHeighliner.Msmt.Internal;
 
 /// <summary>
-/// The BouncyCastle <see cref="TlsServer"/> implementation backing <see cref="MsmtServer"/>, pinning
-/// the connection to the MSMT ICD's TLS configuration and enforcing mutual certificate authentication.
+/// The BouncyCastle <see cref="TlsServer"/> implementation used by every connection this library
+/// accepts, pinning it to the MSMT ICD's TLS configuration and enforcing mutual certificate
+/// authentication.
 /// </summary>
-internal sealed class MsmtTlsServer(MsmtHostOptions options) : DefaultTlsServer(MsmtBcCryptography.Crypto)
+/// <param name="credentials">This side's identity and the certificate authorities it trusts.</param>
+/// <param name="requireFullyQualifiedHostname">Whether a connecting client's "server_name" must be a fully qualified DNS hostname rather than merely a syntactically valid one.</param>
+internal sealed class MsmtTlsServer(MsmtCredentials credentials, bool requireFullyQualifiedHostname) : DefaultTlsServer(MsmtBcCryptography.Crypto)
 {
     /// <summary>Gets the client's identity, once <see cref="NotifyClientCertificate"/> has verified its certificate; <see langword="null"/> beforehand.</summary>
     public MsmtIdentity? ClientIdentity { get; private set; }
@@ -31,8 +34,8 @@ internal sealed class MsmtTlsServer(MsmtHostOptions options) : DefaultTlsServer(
     }
 
     /// <summary>
-    /// Determines whether <paramref name="nameData"/> is an acceptable "server_name" value. When <see
-    /// cref="MsmtHostOptions.RequireFullyQualifiedHostname"/> is enabled, only a fully qualified DNS
+    /// Determines whether <paramref name="nameData"/> is an acceptable "server_name" value. When
+    /// <c>requireFullyQualifiedHostname</c> is enabled, only a fully qualified DNS
     /// hostname is accepted, per the ICD; otherwise, any syntactically plausible value is accepted,
     /// including an IP address literal, per RFC 952/1123 hostname syntax.
     /// </summary>
@@ -46,7 +49,7 @@ internal sealed class MsmtTlsServer(MsmtHostOptions options) : DefaultTlsServer(
         }
 
         UriHostNameType type = Uri.CheckHostName(Encoding.ASCII.GetString(nameData));
-        return options.RequireFullyQualifiedHostname ? type == UriHostNameType.Dns : type != UriHostNameType.Unknown;
+        return requireFullyQualifiedHostname ? type == UriHostNameType.Dns : type != UriHostNameType.Unknown;
     }
 
     /// <inheritdoc />
@@ -63,14 +66,14 @@ internal sealed class MsmtTlsServer(MsmtHostOptions options) : DefaultTlsServer(
             throw new TlsFatalAlert(AlertDescription.handshake_failure);
         }
 
-        (Certificate chain, AsymmetricKeyParameter privateKey) = MsmtBcCryptography.ToBcIdentity(options.Credentials.Identity);
+        (Certificate chain, AsymmetricKeyParameter privateKey) = MsmtBcCryptography.ToBcIdentity(credentials.Identity);
         return new BcDefaultTlsCredentialedSigner(new TlsCryptoParameters(m_context), (BcTlsCrypto)m_context.Crypto, privateKey, chain, signatureAndHashAlgorithm);
     }
 
     /// <inheritdoc />
     public override void NotifyClientCertificate(Certificate clientCertificate)
     {
-        if (!MsmtBcCryptography.IsTrusted(clientCertificate, options.Credentials.TrustedAuthorities))
+        if (!MsmtBcCryptography.IsTrusted(clientCertificate, credentials.TrustedAuthorities))
         {
             throw new TlsFatalAlert(AlertDescription.bad_certificate);
         }

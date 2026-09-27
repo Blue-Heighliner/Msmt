@@ -1,9 +1,9 @@
 namespace BlueHeighliner.Msmt.Internal;
 
 /// <summary>
-/// Tracks every tagged send of a peer independently of which pooled <see cref="MsmtClient"/> carried it,
-/// so a package stays observable and cancellable after its client has been evicted. Backs <see
-/// cref="IMsmtPeer.Packages"/> and <see cref="IMsmtPeer.GetPackage"/>.
+/// Tracks every tagged send of an <see cref="IMsmtPeer"/> independently of which pooled <see
+/// cref="MsmtTargetSender"/> carried it, so a package stays observable and cancellable after its sender has
+/// been evicted. Backs <see cref="IMsmtPeer.Packages"/> and <see cref="IMsmtPeer.GetPackage"/>.
 /// </summary>
 internal interface IMsmtPackageTracker
 {
@@ -73,7 +73,7 @@ internal sealed class MsmtPackageTracker(TimeSpan? retention = null, TimeProvide
 
         entry.Status = status;
 
-        if (status is MsmtSendStatus.Completed or MsmtSendStatus.Cancelled)
+        if (status is MsmtSendStatus.Completed or MsmtSendStatus.Cancelled or MsmtSendStatus.Failed)
         {
             entry.CancelSource = null;
             finishedEntries.Enqueue((tag, entry, clock.GetUtcNow()));
@@ -116,7 +116,7 @@ internal sealed class MsmtPackageTracker(TimeSpan? retention = null, TimeProvide
 
     /// <inheritdoc />
     public IReadOnlyList<IMsmtPackage> GetActivePackages() =>
-        [.. entries.Where(pair => pair.Value.Status is not (MsmtSendStatus.Completed or MsmtSendStatus.Cancelled)).Select(pair => new MsmtPackage(this, pair.Key, pair.Value.Target, pair.Value.Status))];
+        [.. entries.Where(pair => pair.Value.Status is not (MsmtSendStatus.Completed or MsmtSendStatus.Cancelled or MsmtSendStatus.Failed)).Select(pair => new MsmtPackage(this, pair.Key, pair.Value.Target, pair.Value.Status))];
 
     /// <inheritdoc />
     public void RemoveExpired()

@@ -1,99 +1,115 @@
 # API Reference
 
-The public API of [`Core/`](../Core) is a single peer-to-peer type, `IMsmtPeer`. This document covers the
-*design and flow* of that surface - how the pieces fit together and the order events happen in - using
-public types only. Every public and internal type is also fully documented with XML doc comments in the
-source - this document does not restate them.
+The public API of [`Core/`](../Core) is two shapes that never mix. `IMsmtMessagePeer` sends messages directly to
+targets and receives them directly from targets, using message mode or message-with-rekeying mode; its
+connections are internal and never exposed. `IMsmtSessionPeer` listens for and opens session mode
+connections, which are bidirectional, and data moves through the `IMsmtConnection` objects it hands out.
+`IMsmtReachabilityChecker` is a third, narrower piece: a "ping" that checks a remote peer is reachable
+without belonging to either shape. This document covers the *design and flow* of that surface using public
+types only. Every public and internal type is also fully documented with XML doc comments in the source -
+this document does not restate them.
 
 ## Shape of the API
 
-`IMsmtPeerFactory.Create(MsmtOptions)` is the only way to obtain an `IMsmtPeer`. `MsmtOptions` carries
-one node's `MsmtCredentials` (certificate identity and trusted authorities) plus the connection-behavior
-defaults applied uniformly to every connection that peer accepts or creates.
+`IMsmtMessagePeer.IFactory` and `IMsmtSessionPeer.IFactory` are the ways to obtain a peer or session peer,
+each taking its own options record (`MsmtMessagePeerOptions`, `MsmtSessionPeerOptions`) that extends
+`MsmtOptions` with what every endpoint shares: `MsmtCredentials` (certificate identity and trusted
+authorities) and the handshake, stall, response and TCP keep-alive timeouts.
+`IMsmtReachabilityChecker` needs no factory, since it carries no configuration of its own - its `Reach`
+method takes a plain `MsmtOptions` directly, one call at a time.
 
-A peer is symmetric: it manages at most one listener (started explicitly via `StartListener`) for
-connections other peers open to it, and a separate outgoing connection per remote target it has been
-asked to send to, created on demand the first time `Send`/`Request` names that target and cached for
-reuse afterward. Listening and sending are entirely independent - a peer that never calls `StartListener`
-can still send to others, and one that does can simultaneously receive from peers it never explicitly
-dialed. This is why there is one `IMsmtPeer` type rather than separate client/server types: most
-applications need to do both at once, and the ICD's messages/acknowledgements pair up naturally regardless
-of which side of a given TCP connection they flow over.
+The split follows the ICD. Message mode and message-with-rekeying are client-to-server exchanges: the
+sender sends and the listener acknowledges, so a peer needs no notion of a connection at all. Session mode
+is the one mode whose connection outlives a message and is negotiated up front, and it is the one that can
+be used in both directions, so it is the only place a connection is worth handing to the application.
 
-Everything a peer does - connecting, disconnecting, receiving, and a tagged send's progress - is surfaced
-through eight `IObservable<T>` properties rather than `async` callbacks or `Task`-returning hooks. This
-keeps the shape of "notify me when X happens, possibly many times, for as long as I'm subscribed" separate
-from "await this one operation's result", which `Send`/`Request`/`Test` already cover on their own.
+`IMsmtMessagePeer` and `IMsmtSessionPeer` both implement `IMsmtPeer`, which declares what they share and
+nothing else: a listener (`Listener`, `StartListener`, `StopListener`), tagged-send tracking
+(`PackageChanged`, `Packages`, `GetPackage`), and disposal. Code that only needs those - starting a
+listener, or looking up a package by tag without caring which kind of peer sent it - can depend on
+`IMsmtPeer` directly; everything mode-specific (`Send`/`Request`/`Receiver` on a message peer; `Connect`,
+`Connected`, `Disconnected`, `Connections`, `Receiver` on a session peer) stays on its own interface.
 
-## Message flow
+A tagged send's progress is surfaced through the `PackageChanged` `IObservable<T>`, since it is fundamentally
+"notify me when X happens, possibly many times, for as long as I'm subscribed" - one queued payload can pass
+through several statuses over its lifetime. Receiving a message is the opposite shape: exactly one decision
+per message, awaited by whatever's sending it, so it is a single settable delegate property (`Receiver`,
+of type `MsmtMessageReceiver` or `MsmtSessionReceiver`) instead, invoked and awaited once per message
+received.
 
-Sending and receiving a single request-response message touches the API roughly in this order:
+## Peer message flow
 
-1. `peer.Send`/`peer.Request` is called with a target and a payload. If no connection to that target
-   exists yet, one is created and cached; either way the payload is only *enqueued* - the call returns
-   immediately (or, for `Request`, returns a `Task<MsmtResponse>` that completes later).
-2. `Linking` publishes once the new connection begins its TLS handshake (skipped if a connection was
-   already cached and reused).
-3. `Linked` publishes once that handshake completes and the connection is secured. If this is the
-   target's first active link, `Connected` also publishes, carrying the `IMsmtConnection` pairing this
-   peer's sending and receiving directions with that target.
-4. `PackageChanged` publishes as the queued payload progresses - `Queued` → `Transmitting` → (for
-   `Request` only, since a plain `Send` never waits for an acknowledgement) `PendingAcknowledgement` →
-   `Completed` - if the send was given a `Tag`. An untagged send skips this step entirely.
-5. On the remote peer, the same `Linking` → `Linked` → (if this is that peer's target's first active
-   link) `Connected` sequence fires for its own accepted link - symmetric with steps 2-3 above, just for
-   the receiving direction instead of the sending one. Once that completes, `Received` publishes once its
-   listener has read the full message. A subscriber may accept or reject it via
-   `MsmtReceivedEventArgs.Responder`, or let it be accepted automatically once every subscriber has run.
-6. Back on the sending side, `Request`'s `Task<MsmtResponse>` completes with the remote peer's decision and
-   any payload it sent back. A plain `Send` never waits for this and has no `MsmtResponse` to observe.
-7. Eventually the link closes - immediately after this exchange in `Message` mode, after some number of
-   further exchanges in `MessageWithRekeying`/`Session` mode, or once idled out or evicted. `Unlinked`
-   publishes when it does, and `Disconnected` once the connection holds no links in either direction.
+1. `peer.Send`/`peer.Request` is called with a target and a payload. The payload is only *enqueued*: the
+   call returns immediately (or, for `Request`, returns a `Task<MsmtResponse>` that completes later).
+2. The peer opens a connection to the target if its mode calls for one, exchanges the message, and
+   `PackageChanged` publishes as the payload progresses - `Queued`, `Transmitting`, (for `Request` only)
+   `PendingAcknowledgement`, then `Completed` - if the send was given a `Tag`. An untagged send skips this.
+3. On the remote peer, its `Receiver` is invoked and awaited once its listener has read the full message,
+   returning an `MsmtReceiveResult` that decides how to acknowledge it.
+4. Back on the sending side, `Request`'s `Task<MsmtResponse>` completes with the remote peer's decision and
+   any payload it sent back. A plain `Send` never waits for this.
 
-`LinkFailed` instead of `Linked` publishes if step 2's handshake never completes.
+A send that fails ends `Failed` with the exception in `MsmtPackageChange.Exception`, but only if
+it was tagged; an untagged `Send` has no way to report a failure, so use a tag or `Request` where it matters.
 
-## Connections and links
+## Session flow
 
-An `IMsmtConnection` is this peer's logical relationship with one remote target (matched by address and
-port, ignoring TLS server name): up to one outgoing `Sender` link and up to one incoming `Receiver` link,
-either of which may be `null` if that direction isn't currently open. Both are `IMsmtLink`s - `Kind`
-distinguishes which direction one is, and `Connection` reaches back to the pairing. `IMsmtConnection.Drop`/
-`Disconnect` always act on both links at once; to end just one direction, call `Drop`/`Disconnect` on that
-link itself (e.g. `connection.Sender?.Drop()`).
+`IMsmtSessionPeer.StartListener` begins listening; `Connect` starts opening a connection and returns it
+immediately, still `MsmtConnectionStatus.Connecting` - the TCP connect, TLS handshake, and session
+negotiation all happen in the background. Await `IMsmtConnection.Wait` to find out whether it succeeded
+(`true`) or the connection went straight to `Disconnected` without ever connecting (`false`), or dispose
+the connection to abandon the attempt. On the accepting side, `Connected` publishes the same kind of
+object once it is established; a connection this peer opened itself is not raised there, since `Connect`
+already handed it straight back. From then on the two connection objects are symmetric: either can
+`Send`/`Request`, and each side's messages arrive through the owning peer's `Receiver`. At most one message
+per direction is in flight at a time, but the two directions do not wait for each other.
 
-Because MSMT's client-request/server-response model means an incoming connection can only ever acknowledge
-what was sent to it, never push something new, a peer always replies to a remote peer by dialing back out
-to it as a client, never by writing to a connection that peer itself opened. `Send`/`Request` are the only
-way to transmit; `IMsmtConnection`/`IMsmtLink` only ever expose `Drop`/`Disconnect` to end a link, not to
-send over it.
-
-`peer.ActiveConnections` snapshots every connection currently holding at least one link;
-`peer.GetActiveConnection` looks one up by target, but only while it holds exactly one linked link - it
-returns `null` if both or neither of a connection's links are linked.
+A connection carries no events of its own - every notification about it that is inherently repeated, such
+as a tagged send's progress or it ending, is raised through the owning `IMsmtSessionPeer`'s `PackageChanged`
+and `Disconnected`, each carrying the `IMsmtConnection` it is about; receiving a message instead goes
+through the peer's single `Receiver`. `Disconnected` publishes once for every connection that ends,
+however it ends - including one that never finished connecting, such as a client that never completes its
+handshake or does not negotiate a session, or a remote peer that never answers one this peer opened - so
+there is no separate "connect failed" event to watch in addition to it.
 
 ## Receiving and acknowledging
 
-`Received` carries the payload, the `Receiver` link it arrived on, whether the sender requested an
-acknowledgement (`IsResponseRequested`), and an `IMsmtResponder` to decide with. A subscriber calls
-`Responder.Accept()`/`Reject()` synchronously, optionally with a payload of its own; if no subscriber
-decides, the message is accepted automatically once every subscriber has run. Calling `Responder.Defer()`
-opts out of that automatic acceptance, handing the decision to whatever else holds the responder -
-including code running after the deferring subscriber has already returned.
+A peer's `Receiver` (`MsmtMessageReceiver` or `MsmtSessionReceiver`) is invoked and awaited once per
+message, carrying the payload, the sender's address and verified identity (or, for a session connection,
+the connection it arrived on), and whether the sender requested an acknowledgement
+(`isResponseRequested`). It returns an `MsmtReceiveResult?` deciding how to acknowledge the message: `null`
+if the sender never requested one - the only valid answer in that case, and it sends no acknowledgement at
+all, not even a wire-level one - or `MsmtReceiveResult.Accept()`/`.Reject()`, optionally with a payload of
+its own, when one was requested. Returning `null` when one was requested, or a non-null result when one
+wasn't, is an error, closing the connection with an `InvalidOperationException`. Different connections may
+invoke the same `Receiver` concurrently, so it must be safe to run at once for more than one message.
 
-`Accept()`/`Reject()` only work when `IsResponseRequested` is `true` (i.e. the sender used `Request`, not
-`Send`) - calling either otherwise throws. A plain `Send`'s wire acknowledgement always reports success,
-since there is no acknowledgement through which the application could report otherwise.
+Deciding later - after awaiting something else first - is simply not returning until then: since `Receiver`
+is awaited, whatever the handler awaits before it returns is what "later" means, rather than a separate
+deferral mechanism. The sender's `ResponseTimeout` still bounds how long that may take. On a session
+connection the connection keeps reading meanwhile, so a message this side sent is still acknowledged.
 
 ## Sending options and tracking
 
 A single MSMT message or acknowledgement carries at most `MsmtLimits.MaxPayloadLength` bytes (16 MiB - 1),
-the largest length its header can declare. `Send`/`Request` and `IMsmtResponder`'s payload-carrying
+the largest length its header can declare. `Send`/`Request` and `MsmtReceiveResult`'s payload-carrying
 accept/reject overloads throw `ArgumentOutOfRangeException` for anything larger rather than transmitting a
 message the remote peer would reject as malformed; bundle application-level messages to stay within it.
 
 `MsmtSendOptions` governs one queued payload: an optional `Tag` to identify it across `PackageChanged` and
-`GetPackage`, a `Priority` among other queued payloads on the same connection, and an optional `Dscp`
+`GetPackage`, a `Priority` among other queued payloads to the same destination, and an optional `Dscp`
 marking for QoS. `IMsmtPackage` (returned by `GetPackage`, and carried on `Packages`/`PackageChanged`) is
 the handle for a tagged send: its `Status` (an `MsmtSendStatus`) always reflects the send's current
-progress, and `Cancel()` requests best-effort cancellation.
+progress, and `Cancel()` requests best-effort cancellation. Both `IMsmtMessagePeer` and `IMsmtSessionPeer`
+track their own packages (`Packages`/`GetPackage`, declared on the shared `IMsmtPeer`) independently of
+which connection or pooled sender carried a tagged send, so a package stays available after that connection
+or sender is gone, until it has been finished for five minutes; `IMsmtConnection` itself tracks no packages
+of its own.
+
+## Failures
+
+Timeouts surface as `TimeoutException`, from `Request` and `IMsmtReachabilityChecker.Reach` to their
+callers and through the events to observers: a handshake that never completes, a transfer that stalls, or
+a message that is never acknowledged. A cancelled `CancellationToken` surfaces as
+`OperationCanceledException`. A remote peer that rejects a message's header or does not support the mode
+fails the request with `InvalidOperationException`.

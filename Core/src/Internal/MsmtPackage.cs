@@ -2,8 +2,8 @@ namespace BlueHeighliner.Msmt.Internal;
 
 /// <summary>
 /// A tagged payload tracked by an <see cref="IMsmtPackageTracker"/>, backing <see
-/// cref="IMsmtPeer.Packages"/> and <see cref="IMsmtPeer.GetPackage"/>. Independent of the pooled <see
-/// cref="MsmtClient"/> that carried it, so it keeps working after that client has been evicted.
+/// cref="IMsmtPeer.Packages"/> and <see cref="IMsmtPeer.GetPackage"/>. Independent of the connection or
+/// per-target sender that carried it, so it keeps working after that has been evicted.
 /// </summary>
 /// <param name="tracker">The tracker the tagged payload is registered with.</param>
 /// <param name="tag">The tag identifying the payload.</param>
@@ -12,7 +12,7 @@ namespace BlueHeighliner.Msmt.Internal;
 internal sealed class MsmtPackage(IMsmtPackageTracker tracker, object tag, MsmtNameTarget target, MsmtSendStatus initialStatus) : IMsmtPackage
 {
     private MsmtSendStatus status = initialStatus;
-    private bool isFinal = initialStatus is MsmtSendStatus.Completed or MsmtSendStatus.Cancelled;
+    private bool isFinal = initialStatus is MsmtSendStatus.Completed or MsmtSendStatus.Cancelled or MsmtSendStatus.Failed;
 
     /// <inheritdoc />
     public object Tag { get; } = tag;
@@ -28,7 +28,7 @@ internal sealed class MsmtPackage(IMsmtPackageTracker tracker, object tag, MsmtN
             if (!isFinal)
             {
                 status = tracker.GetStatus(Tag) ?? status;
-                isFinal = status is MsmtSendStatus.Completed or MsmtSendStatus.Cancelled;
+                isFinal = status is MsmtSendStatus.Completed or MsmtSendStatus.Cancelled or MsmtSendStatus.Failed;
             }
 
             return status;

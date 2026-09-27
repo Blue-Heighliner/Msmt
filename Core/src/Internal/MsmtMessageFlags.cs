@@ -27,7 +27,7 @@ internal enum MsmtMessageFlags : ushort
     /// <summary>Set by the receiver to indicate the received message header was malformed or used an unsupported API version.</summary>
     InvalidPreambleOrModeUnsupported = 0x8,
 
-    /// <summary>Set by either side to signify this message is negotiating (client) or responding to (server) a <see cref="MsmtOperationMode.Session"/> connection lifetime.</summary>
+    /// <summary>Set by either side to signify this message is negotiating (client) or responding to (server) a session connection lifetime.</summary>
     SessionModeNegotiation = 0x10,
 
     /// <summary>Set by a server accepting a Session Mode negotiation request, together with the agreed lifetime encoded in the acknowledgement payload.</summary>
