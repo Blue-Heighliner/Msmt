@@ -30,8 +30,10 @@ own subject, tagging the payload with the connection it came from (`MsmtPackageC
 `MsmtDisconnection.Connection`) so a subscriber watching the peer-wide observable can still tell
 connections apart; `OnDisconnected` also removes the connection from the registry, whether it disconnected
 after connecting or never connected at all. `OnReceived` instead forwards straight to whatever `Receiver`
-is currently set, awaiting and returning its `MsmtReceiveResult?` back to the connection - there is no
-subject here, since exactly one decision is needed per message.
+is currently set, passing along the payload and responder - there is no subject here, since exactly one
+decision is needed per message. A `Receiver` that throws is caught there and published on the peer's
+`Exceptions`, leaving the connection and later messages alone; the same subject also carries the
+listener's failed accepts and subscribers to `PackageChanged` or `Disconnected` that throw.
 
 ## Tagged-send tracking
 

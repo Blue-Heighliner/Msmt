@@ -31,7 +31,7 @@ internal sealed class MsmtConnection : IMsmtConnection, IMsmtEvictable
         MsmtTarget remote,
         MsmtConnectionDirection direction,
         IMsmtPackageTracker? tracker = null,
-        Func<MsmtConnection, ReadOnlyMemory<byte>, bool, ValueTask<MsmtReceiveResult?>>? onReceived = null,
+        Action<MsmtConnection, IMemoryOwner<byte>, IMsmtResponder?>? onReceived = null,
         Action<MsmtConnection, MsmtPackageChange>? onPackageChanged = null,
         Action<MsmtConnection, Exception?>? onDisconnected = null)
     {
@@ -49,7 +49,7 @@ internal sealed class MsmtConnection : IMsmtConnection, IMsmtEvictable
     private readonly MsmtTarget remote;
     private readonly IMsmtPackageTracker tracker;
     private readonly IMsmtOutbox outbox;
-    private readonly Func<MsmtConnection, ReadOnlyMemory<byte>, bool, ValueTask<MsmtReceiveResult?>>? onReceived;
+    private readonly Action<MsmtConnection, IMemoryOwner<byte>, IMsmtResponder?>? onReceived;
     private readonly Action<MsmtConnection, Exception?>? onDisconnected;
     private readonly Channel<MsmtFrame> inbound = Channel.CreateBounded<MsmtFrame>(new BoundedChannelOptions(4) { SingleReader = true, SingleWriter = true, FullMode = BoundedChannelFullMode.Wait });
     private readonly SemaphoreSlim writeLock = new(1, 1);
@@ -509,15 +509,7 @@ internal sealed class MsmtConnection : IMsmtConnection, IMsmtEvictable
             // before the connection started closing must not be cut short by that same closing.
             await foreach (MsmtFrame frame in inbound.Reader.ReadAllAsync(CancellationToken.None))
             {
-                Interlocked.Increment(ref inboundBusy);
-                try
-                {
-                    await HandleRequest(frame);
-                }
-                finally
-                {
-                    Interlocked.Decrement(ref inboundBusy);
-                }
+                HandleRequest(frame);
             }
         }
         catch (OperationCanceledException) when (Status == MsmtConnectionStatus.Disconnected)
@@ -529,38 +521,66 @@ internal sealed class MsmtConnection : IMsmtConnection, IMsmtEvictable
         }
     }
 
-    private async Task HandleRequest(MsmtFrame frame)
+    private void HandleRequest(MsmtFrame frame)
     {
         MsmtHeader request = frame.Header;
         bool isResponseRequested = (request.Flags & MsmtMessageFlags.AcknowledgementRequestedOrGiven) == MsmtMessageFlags.AcknowledgementRequestedOrGiven;
-        MsmtReceiveResult? result;
+        MsmtResponder? responder = isResponseRequested
+            ? new MsmtResponder((success, payload) => _ = Answer(request, success, payload))
+            : null;
+
+        Interlocked.Increment(ref inboundBusy);
 
         try
         {
-            result = onReceived is null
-                ? (isResponseRequested ? MsmtReceiveResult.Accept() : null)
-                : await onReceived(this, frame.Payload.Memory, isResponseRequested);
-        }
-        finally
-        {
-            frame.Payload.Dispose();
-        }
-
-        if (result is { } decided)
-        {
-            if (!isResponseRequested)
+            if (onReceived is null)
             {
-                throw new InvalidOperationException("A receiver must return null for a message that did not request an acknowledgement.");
+                frame.Payload.Dispose();
+                responder?.Accept();
             }
-
-            MsmtMessageFlags flags = (decided.Success ? MsmtMessageFlags.MessageSuccess : MsmtMessageFlags.None) | MsmtMessageFlags.AcknowledgementRequestedOrGiven;
-            using IMemoryOwner<byte> responsePayload = decided.Payload ?? EmptyMemoryOwner.Instance;
-            await Respond(request, flags, responsePayload.Memory, lifetime.Token);
+            else
+            {
+                onReceived(this, frame.Payload, responder);
+            }
         }
-        else if (isResponseRequested)
+        catch
         {
-            throw new InvalidOperationException("A receiver must return a non-null result for a message that requested an acknowledgement.");
+            Interlocked.Decrement(ref inboundBusy);
+            throw;
         }
+
+        if (responder is null)
+        {
+            FinishRequest();
+        }
+    }
+
+    private async Task Answer(MsmtHeader request, bool success, IMemoryOwner<byte>? payload)
+    {
+        try
+        {
+            using (payload)
+            {
+                MsmtMessageFlags flags = (success ? MsmtMessageFlags.MessageSuccess : MsmtMessageFlags.None) | MsmtMessageFlags.AcknowledgementRequestedOrGiven;
+                await Respond(request, flags, payload is null ? ReadOnlyMemory<byte>.Empty : payload.Memory, lifetime.Token);
+            }
+        }
+        catch (Exception exception) when (Status != MsmtConnectionStatus.Disconnected)
+        {
+            await Terminate(exception, false);
+            return;
+        }
+        catch (Exception)
+        {
+            return;
+        }
+
+        FinishRequest();
+    }
+
+    private void FinishRequest()
+    {
+        Interlocked.Decrement(ref inboundBusy);
 
         long now = DateTime.UtcNow.Ticks;
         Interlocked.Exchange(ref lastInboundActivityTicks, now);

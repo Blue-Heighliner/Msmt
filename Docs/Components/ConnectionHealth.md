@@ -32,9 +32,9 @@ the channel is asynchronous:
 
 A read stalls when no bytes arrive for the stall timeout, restarting on each chunk, so a large message on a
 slow but working link is never cut off. `ResponseTimeout` also matters because sends are processed one at a
-time: an unresponsive peer would otherwise block every later send to it. A `Receiver` that awaits something
-else before deciding is never timed out on the side that holds it; that is application policy, and the
-remote sender's `ResponseTimeout` protects it. A timeout closes the connection and is reported as a
+time: an unresponsive peer would otherwise block every later send to it. A message the application is slow to answer,
+or never answers, is never timed out on the side that holds it; that is application policy, and the remote
+sender's `ResponseTimeout` protects it. A timeout closes the connection and is reported as a
 `TimeoutException`.
 
 ## Bounding lifetime and unused connections

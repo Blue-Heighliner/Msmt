@@ -43,14 +43,18 @@ closed before finishing.
   from the remote side and is queued for the handler loop, or, on a connection that does not accept
   requests, is a protocol violation that closes it. The reader never waits on the application, so an
   acknowledgement this side is waiting for is never stuck behind a slow subscriber.
-- The **handler loop** takes those requests one at a time, invokes and awaits `onReceived`, and, if the
-  message requested an acknowledgement, writes the `MsmtReceiveResult` it returned; a handler that keeps
-  awaiting before returning therefore delays only later messages from the same sender. A message that did
-  not request one gets no acknowledgement written at all, and `onReceived` must return `null` for it - the
-  reverse mismatch (a non-null result for one that wasn't requested, or `null` for one that was) is a
-  contract violation that closes the connection. The queue between the two loops is small and bounded; a
-  peer that sends faster than the application handles simply stops being read, and flow control pushes back
-  on it.
+- The **handler loop** takes those requests one at a time and calls `onReceived`, synchronously, with the
+  payload, which the receiver then owns, and, if the message requested an acknowledgement, an
+  `MsmtResponder`. Answering it queues the acknowledgement to be written in the background and returns at
+  once, and a second answer is refused. What the receiver does and when it answers is up to the application:
+  the connection neither waits for an answer nor checks that one comes, so an unanswered message is left to
+  the sender's response timeout. A message counts as being handled, keeping the connection non-idle, until
+  the receiver returns for one that did not request an acknowledgement, or until its acknowledgement has
+  been written for one that did, and the rekey-limit and lifetime checks that close a connection after a
+  message run then too, so a connection never closes under a message still waiting to be answered. A
+  message that did not request an acknowledgement gets no responder and none is written. A receiver that
+  blocks holds up the loop, and the queue between the two loops is small and bounded, so a peer that sends
+  faster than the application handles simply stops being read, and flow control pushes back on it.
 - The **send queue** (`MsmtOutbox`) sends this side's requests, one at a time, if `MsmtConnectionSettings.
   ProcessSends` is `true` (the default). Each `Exchange` writes the message and, only if it requested an
   acknowledgement (or is a keep-alive or reachability check, which always get one), waits for it under the

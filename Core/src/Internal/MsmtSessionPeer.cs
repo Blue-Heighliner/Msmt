@@ -19,6 +19,8 @@ internal sealed class MsmtSessionPeer : IMsmtSessionPeer
     {
         options.Validate();
         this.options = options;
+        disconnected = new MsmtEventSubject<MsmtDisconnection>(Report);
+        packageChanged = new MsmtEventSubject<MsmtPackageChange>(Report);
         connector = new MsmtConnector(options, options.RequireFullyQualifiedHostname);
     }
 
@@ -27,8 +29,9 @@ internal sealed class MsmtSessionPeer : IMsmtSessionPeer
     private readonly IMsmtPackageTracker packageTracker = new MsmtPackageTracker();
     private readonly ConcurrentDictionary<MsmtConnection, byte> connections = new();
     private readonly MsmtEventSubject<IMsmtConnection> connected = new();
-    private readonly MsmtEventSubject<MsmtDisconnection> disconnected = new();
-    private readonly MsmtEventSubject<MsmtPackageChange> packageChanged = new();
+    private readonly MsmtEventSubject<Exception> exceptions = new();
+    private readonly MsmtEventSubject<MsmtDisconnection> disconnected;
+    private readonly MsmtEventSubject<MsmtPackageChange> packageChanged;
     private readonly CancellationTokenSource disposalCancellation = new();
 
     private IMsmtListener? listener;
@@ -42,6 +45,9 @@ internal sealed class MsmtSessionPeer : IMsmtSessionPeer
 
     /// <inheritdoc />
     public IObservable<MsmtPackageChange> PackageChanged => packageChanged;
+
+    /// <inheritdoc />
+    public IObservable<Exception> Exceptions => exceptions;
 
     /// <inheritdoc />
     public MsmtSessionReceiver? Receiver { get; set; }
@@ -69,7 +75,7 @@ internal sealed class MsmtSessionPeer : IMsmtSessionPeer
         MsmtListener newListener = new();
         try
         {
-            newListener.Start(host, port, OnAccepted, disposalCancellation.Token);
+            newListener.Start(host, port, OnAccepted, Report, disposalCancellation.Token);
         }
         catch
         {
@@ -204,8 +210,36 @@ internal sealed class MsmtSessionPeer : IMsmtSessionPeer
 
     private void Track(MsmtConnection connection) => connections[connection] = 0;
 
-    private ValueTask<MsmtReceiveResult?> OnReceived(MsmtConnection connection, ReadOnlyMemory<byte> payload, bool isResponseRequested) =>
-        Receiver is null ? new ValueTask<MsmtReceiveResult?>(isResponseRequested ? MsmtReceiveResult.Accept() : null) : Receiver(connection, payload, isResponseRequested);
+    private void OnReceived(MsmtConnection connection, IMemoryOwner<byte> payload, IMsmtResponder? responder)
+    {
+        if (Receiver is null)
+        {
+            payload.Dispose();
+            responder?.Accept();
+            return;
+        }
+
+        try
+        {
+            Receiver(connection, payload, responder);
+        }
+        catch (Exception exception)
+        {
+            Report(exception);
+        }
+    }
+
+    private void Report(Exception exception)
+    {
+        try
+        {
+            exceptions.Publish(exception);
+        }
+        catch (Exception)
+        {
+            // A subscriber to the exceptions themselves throwing has nowhere left to be reported.
+        }
+    }
 
     private void OnPackageChanged(MsmtConnection connection, MsmtPackageChange args) =>
         packageChanged.Publish(args with { Connection = connection });

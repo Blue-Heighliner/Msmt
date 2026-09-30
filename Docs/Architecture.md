@@ -76,9 +76,12 @@ choosing the simplest possible observable - hot, synchronous, no buffering or re
 reactive-extensions dependency for behavior the library never needs (scheduling, backpressure, operators).
 
 Receiving a message is deliberately not one of these: exactly one decision is ever needed per message, so
-`Receiver` is a plain settable delegate property (`MsmtMessageReceiver`/`MsmtSessionReceiver`), awaited
-once per message to decide how to acknowledge it, rather than an `IObservable<T>` with nothing to multicast
-to.
+`Receiver` is a plain settable synchronous delegate property (`MsmtMessageReceiver`/`MsmtSessionReceiver`),
+invoked once per message with an `IMsmtResponder` to acknowledge it through, rather than an
+`IObservable<T>` with nothing to multicast to. It is synchronous, and completing it does not mean the
+message is done, so anything slow or asynchronous is the application's to do and to answer from afterward. A receiver that
+throws is not a reason to drop a connection, so the exception goes to the peer's `Exceptions` observable
+instead, along with the other failures that don't end a connection and would otherwise go unseen.
 
 A session connection itself carries none of the observable subjects: it takes callbacks at construction
 time instead, and its owning `IMsmtSessionPeer` republishes the repeating ones into its own peer-wide
@@ -92,11 +95,10 @@ rather than needing to subscribe to each connection individually as it appears.
 Legacy message-handling traffic is high-volume and latency-sensitive, so the API is built around
 `IMemoryOwner<byte>` and pool-rented buffers rather than always allocating a fresh `byte[]` per message.
 Ownership transfers at each hand-off (into `Send`/`Request`, out through `MsmtResponse`, into
-`MsmtReceiveResult.Accept`/`.Reject`) so exactly one side is ever responsible for returning a buffer to its
-pool. A received message's own payload is the exception: it is exposed to `Receiver` as a
-`ReadOnlyMemory<byte>` over a buffer the connection still owns, and disposes once the handler's returned
-`ValueTask` completes, since only one handler is ever invoked per message - there is no multicast to share
-ownership across. A `ReadOnlyMemory<byte>` overload is offered everywhere pooled memory is accepted for an
+`IMsmtResponder.Accept`/`.Reject`, and into `Receiver` for a received message's own payload) so exactly one
+side is ever responsible for returning a buffer to its pool. A receiver gets the payload itself rather than
+a view of it because only one handler is ever invoked per message - there is no multicast to share
+ownership across - so it can dispose the buffer the moment it is done, however long it takes to answer. A `ReadOnlyMemory<byte>` overload is offered everywhere pooled memory is accepted for an
 outgoing payload, wrapping it in a non-owning shim, so callers who don't use pooling aren't forced to.
 
 ## Automatic on-demand connection lifecycle

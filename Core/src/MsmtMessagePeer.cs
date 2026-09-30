@@ -13,8 +13,10 @@ public interface IMsmtMessagePeer : IMsmtPeer
     /// <summary>
     /// Gets or sets the <see cref="MsmtMessageReceiver"/> invoked for every application message this peer's
     /// listener accepts; <see langword="null"/> (the default) accepts every message automatically without
-    /// reporting it anywhere. Different connections may invoke this concurrently, so it must be safe to run
-    /// at once for more than one message.
+    /// reporting it anywhere. Messages on one connection are delivered one at a time, in order, but different
+    /// connections may invoke this concurrently, so it must be safe to run at once for more than one
+    /// message. An exception it throws is published on <see cref="IMsmtPeer.Exceptions"/> and leaves the
+    /// connection alone.
     /// </summary>
     MsmtMessageReceiver? Receiver { get; set; }
 

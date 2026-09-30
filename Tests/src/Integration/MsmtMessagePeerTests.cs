@@ -13,10 +13,14 @@ public sealed class MsmtMessagePeerTests
         await using MsmtMessagePeer peerB = Listener(certificateB, trustedAuthorities);
         await using MsmtMessagePeer peerA = Sender(certificateA, trustedAuthorities);
         TaskCompletionSource<(byte[] Payload, bool IsResponseRequested, MsmtIdentity Identity, MsmtTarget Source)> received = new();
-        peerB.Receiver = (source, identity, payload, isResponseRequested) =>
+        peerB.Receiver = (source, identity, payload, responder) =>
         {
-            received.TrySetResult((payload.ToArray(), isResponseRequested, identity, source));
-            return new ValueTask<MsmtReceiveResult?>(MsmtReceiveResult.Accept("ack"u8.ToArray()));
+            using (payload)
+            {
+                received.TrySetResult((payload.Memory.ToArray(), responder is not null, identity, source));
+            }
+
+            responder!.Accept("ack"u8.ToArray());
         };
         peerB.StartListener(0, "127.0.0.1");
 
@@ -31,54 +35,103 @@ public sealed class MsmtMessagePeerTests
         Assert.Equal("127.0.0.1", source.Host);
     }
 
-    /// <summary>A plain send is delivered without asking for an acknowledgement, and the receiver must return null for it.</summary>
+    /// <summary>A plain send is delivered without asking for an acknowledgement, so its receiver is given no responder.</summary>
     [Fact]
-    public async Task Send_NoAcknowledgementRequested_IsDeliveredAndReceiverMustReturnNull()
+    public async Task Send_NoAcknowledgementRequested_IsDeliveredWithoutResponder()
     {
         (X509Certificate2 certificateA, X509Certificate2 certificateB, X509Certificate2Collection trustedAuthorities) = TestMsmtCertificates.Create();
         await using MsmtMessagePeer peerB = Listener(certificateB, trustedAuthorities);
         await using MsmtMessagePeer peerA = Sender(certificateA, trustedAuthorities);
         TaskCompletionSource<bool> received = new();
-        peerB.Receiver = (source, identity, payload, isResponseRequested) =>
+        peerB.Receiver = (source, identity, payload, responder) =>
         {
-            received.TrySetResult(isResponseRequested);
-            return default;
+            payload.Dispose();
+            received.TrySetResult(responder is null);
         };
         peerB.StartListener(0, "127.0.0.1");
 
         peerA.Send(Target(peerB), "hello"u8.ToArray());
 
-        Assert.False(await received.Task.WaitAsync(waitLimit));
+        Assert.True(await received.Task.WaitAsync(waitLimit));
     }
 
-    /// <summary>A receiver that returns a non-null result for a message that did not request an acknowledgement is an error, closing the connection.</summary>
+    /// <summary>A message can be answered after its receiver has returned, and the connection stays open until it is, even in message mode where it otherwise closes after one exchange.</summary>
     [Fact]
-    public async Task Receiver_NonNullResultForUnrequestedAcknowledgement_ClosesConnection()
+    public async Task Request_AnsweredAfterReceiverReturned_ReachesSender()
     {
         (X509Certificate2 certificateA, X509Certificate2 certificateB, X509Certificate2Collection trustedAuthorities) = TestMsmtCertificates.Create();
         await using MsmtMessagePeer peerB = Listener(certificateB, trustedAuthorities);
         await using MsmtMessagePeer peerA = Sender(certificateA, trustedAuthorities);
-        peerB.Receiver = (source, identity, payload, isResponseRequested) => new ValueTask<MsmtReceiveResult?>(MsmtReceiveResult.Accept());
+        TaskCompletionSource<IMsmtResponder> received = new();
+        peerB.Receiver = (source, identity, payload, responder) =>
+        {
+            payload.Dispose();
+            received.TrySetResult(responder!);
+        };
         peerB.StartListener(0, "127.0.0.1");
 
-        peerA.Send(Target(peerB), "hello"u8.ToArray());
+        Task<MsmtResponse> request = peerA.Request(Target(peerB), "hello"u8.ToArray());
+        IMsmtResponder responder = await received.Task.WaitAsync(waitLimit);
+        await Task.Delay(200);
+        Assert.False(request.IsCompleted);
+        responder.Reject("later"u8.ToArray());
 
+        MsmtResponse response = await request.WaitAsync(waitLimit);
+
+        Assert.False(response.Success);
+        Assert.Equal("later", Encoding.ASCII.GetString(response.Payload.Memory.Span));
+        Assert.Throws<InvalidOperationException>(() => responder.Accept());
         await WaitUntil(() => peerB.AcceptedCount == 0);
     }
 
-    /// <summary>A receiver that returns null for a message that requested an acknowledgement is an error, closing the connection and failing the request.</summary>
+    /// <summary>A receiver that throws is reported through the peer's exceptions without affecting later messages.</summary>
     [Fact]
-    public async Task Receiver_NullResultForRequestedAcknowledgement_ClosesConnectionAndFailsRequest()
+    public async Task Receiver_Throws_IsReportedAndLaterMessagesStillDeliver()
     {
         (X509Certificate2 certificateA, X509Certificate2 certificateB, X509Certificate2Collection trustedAuthorities) = TestMsmtCertificates.Create();
         await using MsmtMessagePeer peerB = Listener(certificateB, trustedAuthorities);
         await using MsmtMessagePeer peerA = Sender(certificateA, trustedAuthorities);
-        peerB.Receiver = (source, identity, payload, isResponseRequested) => default;
+        InvalidOperationException thrown = new("receiver failure");
+        Task<Exception> reported = WaitFor(peerB.Exceptions);
+        TaskCompletionSource<string> second = new();
+        peerB.Receiver = (source, identity, payload, responder) =>
+        {
+            string text = Encoding.ASCII.GetString(payload.Memory.Span);
+            payload.Dispose();
+
+            if (text == "first")
+            {
+                throw thrown;
+            }
+
+            second.TrySetResult(text);
+        };
         peerB.StartListener(0, "127.0.0.1");
 
-        await Assert.ThrowsAnyAsync<Exception>(() => peerA.Request(Target(peerB), "hello"u8.ToArray()).WaitAsync(waitLimit));
+        peerA.Send(Target(peerB), "first"u8.ToArray());
+        peerA.Send(Target(peerB), "second"u8.ToArray());
 
-        await WaitUntil(() => peerB.AcceptedCount == 0);
+        Assert.Same(thrown, await reported);
+        Assert.Equal("second", await second.Task.WaitAsync(waitLimit));
+    }
+
+    /// <summary>A subscriber that throws while a tagged send's progress is published is reported through the peer's exceptions, and neither the send nor other subscribers are affected.</summary>
+    [Fact]
+    public async Task PackageChanged_SubscriberThrows_IsReportedAndSendStillCompletes()
+    {
+        (X509Certificate2 certificateA, X509Certificate2 certificateB, X509Certificate2Collection trustedAuthorities) = TestMsmtCertificates.Create();
+        await using MsmtMessagePeer peerB = Listener(certificateB, trustedAuthorities);
+        await using MsmtMessagePeer peerA = Sender(certificateA, trustedAuthorities);
+        peerB.StartListener(0, "127.0.0.1");
+        InvalidOperationException thrown = new("subscriber failure");
+        Task<Exception> reported = WaitFor(peerA.Exceptions);
+        Task<MsmtPackageChange> completed = WaitFor(peerA.PackageChanged, args => args.Status == MsmtSendStatus.Completed);
+        peerA.PackageChanged.Subscribe(_ => throw thrown);
+
+        peerA.Send(Target(peerB), "hello"u8.ToArray(), new MsmtSendOptions { Tag = new object() });
+
+        Assert.Same(thrown, await reported);
+        await completed;
     }
 
     /// <summary>Every message in message mode opens a connection of its own, which is gone again once the exchange ends.</summary>
@@ -89,10 +142,11 @@ public sealed class MsmtMessagePeerTests
         await using MsmtMessagePeer peerB = Listener(certificateB, trustedAuthorities);
         await using MsmtMessagePeer peerA = Sender(certificateA, trustedAuthorities);
         int accepted = 0;
-        peerB.Receiver = (source, identity, payload, isResponseRequested) =>
+        peerB.Receiver = (source, identity, payload, responder) =>
         {
+            payload.Dispose();
             Interlocked.Increment(ref accepted);
-            return new ValueTask<MsmtReceiveResult?>(MsmtReceiveResult.Accept());
+            responder!.Accept();
         };
         peerB.StartListener(0, "127.0.0.1");
 
@@ -113,10 +167,11 @@ public sealed class MsmtMessagePeerTests
         await using MsmtMessagePeer peerB = Listener(certificateB, trustedAuthorities, options => options with { RekeyLimit = 100 });
         await using MsmtMessagePeer peerA = Sender(certificateA, trustedAuthorities, options => options with { RekeyLimit = 100 });
         int maxAccepted = 0;
-        peerB.Receiver = (source, identity, payload, isResponseRequested) =>
+        peerB.Receiver = (source, identity, payload, responder) =>
         {
+            payload.Dispose();
             maxAccepted = Math.Max(maxAccepted, peerB.AcceptedCount);
-            return new ValueTask<MsmtReceiveResult?>(MsmtReceiveResult.Accept());
+            responder!.Accept();
         };
         peerB.StartListener(0, "127.0.0.1");
 
@@ -139,10 +194,11 @@ public sealed class MsmtMessagePeerTests
         await using MsmtMessagePeer peerB = Listener(certificateB, trustedAuthorities, options => options with { RekeyLimit = listenerLimit });
         await using MsmtMessagePeer peerA = Sender(certificateA, trustedAuthorities, options => options with { RekeyLimit = senderLimit });
         int received = 0;
-        peerB.Receiver = (source, identity, payload, isResponseRequested) =>
+        peerB.Receiver = (source, identity, payload, responder) =>
         {
+            payload.Dispose();
             Interlocked.Increment(ref received);
-            return new ValueTask<MsmtReceiveResult?>(MsmtReceiveResult.Accept());
+            responder!.Accept();
         };
         peerB.StartListener(0, "127.0.0.1");
 
@@ -216,14 +272,15 @@ public sealed class MsmtMessagePeerTests
         List<string> order = [];
         TaskCompletionSource firstReceived = new();
         TaskCompletionSource releaseFirst = new();
-        peerB.Receiver = async (source, identity, payload, isResponseRequested) =>
+        peerB.Receiver = (source, identity, payload, responder) =>
         {
-            string text = Encoding.ASCII.GetString(payload.Span);
+            string text = Encoding.ASCII.GetString(payload.Memory.Span);
+            payload.Dispose();
             if (text == "first")
             {
                 firstReceived.TrySetResult();
-                await releaseFirst.Task;
-                return MsmtReceiveResult.Accept();
+                _ = releaseFirst.Task.ContinueWith(_ => responder!.Accept(), TaskScheduler.Default);
+                return;
             }
 
             lock (order)
@@ -231,7 +288,7 @@ public sealed class MsmtMessagePeerTests
                 order.Add(text);
             }
 
-            return MsmtReceiveResult.Accept();
+            responder!.Accept();
         };
         peerB.StartListener(0, "127.0.0.1");
 
@@ -260,15 +317,16 @@ public sealed class MsmtMessagePeerTests
         await using MsmtMessagePeer peerA = Sender(certificateA, trustedAuthorities);
         int received = 0;
         TaskCompletionSource firstReceived = new();
-        peerB.Receiver = async (source, identity, payload, isResponseRequested) =>
+        peerB.Receiver = (source, identity, payload, responder) =>
         {
+            payload.Dispose();
             if (Interlocked.Increment(ref received) == 1)
             {
                 firstReceived.TrySetResult();
-                await Task.Delay(Timeout.Infinite);
+                return;
             }
 
-            return MsmtReceiveResult.Accept();
+            responder!.Accept();
         };
         peerB.StartListener(0, "127.0.0.1");
         using CancellationTokenSource cancellation = new();
@@ -289,14 +347,15 @@ public sealed class MsmtMessagePeerTests
         await using MsmtMessagePeer peerB = Listener(certificateB, trustedAuthorities);
         await using MsmtMessagePeer peerA = Sender(certificateA, trustedAuthorities, options => options with { ResponseTimeout = TimeSpan.FromMilliseconds(500) });
         int received = 0;
-        peerB.Receiver = async (source, identity, payload, isResponseRequested) =>
+        peerB.Receiver = (source, identity, payload, responder) =>
         {
+            payload.Dispose();
             if (Interlocked.Increment(ref received) == 1)
             {
-                await Task.Delay(Timeout.Infinite);
+                return;
             }
 
-            return MsmtReceiveResult.Accept();
+            responder!.Accept();
         };
         peerB.StartListener(0, "127.0.0.1");
 
@@ -333,7 +392,7 @@ public sealed class MsmtMessagePeerTests
         Assert.IsType<NotSupportedException>((await failed).Exception);
     }
 
-    /// <summary>A listening peer drops a client that never handshakes, without exposing anything.</summary>
+    /// <summary>A listening peer drops a client that never handshakes, without exposing a connection, and reports the failure through its exceptions.</summary>
     [Fact]
     public async Task Listener_ClientNeverHandshakes_IsDroppedAndListenerKeepsServing()
     {
@@ -341,6 +400,7 @@ public sealed class MsmtMessagePeerTests
         await using MsmtMessagePeer peerB = Listener(certificateB, trustedAuthorities, options => options with { HandshakeTimeout = TimeSpan.FromMilliseconds(300) });
         await using MsmtMessagePeer peerA = Sender(certificateA, trustedAuthorities);
         peerB.StartListener(0, "127.0.0.1");
+        Task<Exception> reported = WaitFor(peerB.Exceptions);
 
         using TcpClient stalled = new();
         await stalled.ConnectAsync(IPAddress.Loopback, peerB.Listener!.Port);
@@ -348,6 +408,7 @@ public sealed class MsmtMessagePeerTests
 
         using NetworkStream stream = stalled.GetStream();
         Assert.Equal(0, await stream.ReadAsync(new byte[1]).AsTask().WaitAsync(waitLimit));
+        Assert.IsType<TimeoutException>(await reported);
     }
 
     /// <summary>A subscriber that takes longer than the idle time to answer is never disconnected mid-message.</summary>
@@ -357,10 +418,11 @@ public sealed class MsmtMessagePeerTests
         (X509Certificate2 certificateA, X509Certificate2 certificateB, X509Certificate2Collection trustedAuthorities) = TestMsmtCertificates.Create();
         await using MsmtMessagePeer peerB = Listener(certificateB, trustedAuthorities, options => options with { MaxIdleTime = TimeSpan.FromMilliseconds(50) });
         await using MsmtMessagePeer peerA = Sender(certificateA, trustedAuthorities);
-        peerB.Receiver = (source, identity, payload, isResponseRequested) =>
+        peerB.Receiver = (source, identity, payload, responder) =>
         {
+            payload.Dispose();
             Thread.Sleep(1500);
-            return new ValueTask<MsmtReceiveResult?>(MsmtReceiveResult.Accept());
+            responder!.Accept();
         };
         peerB.StartListener(0, "127.0.0.1");
 
@@ -466,11 +528,10 @@ public sealed class MsmtMessagePeerTests
         await using MsmtMessagePeer peerB = Listener(certificateB, trustedAuthorities);
         MsmtMessagePeer peerA = Sender(certificateA, trustedAuthorities);
         TaskCompletionSource received = new();
-        peerB.Receiver = async (source, identity, payload, isResponseRequested) =>
+        peerB.Receiver = (source, identity, payload, responder) =>
         {
+            payload.Dispose();
             received.TrySetResult();
-            await Task.Delay(Timeout.Infinite);
-            return MsmtReceiveResult.Accept();
         };
         peerB.StartListener(0, "127.0.0.1");
         Task<MsmtResponse> inFlight = peerA.Request(Target(peerB), "first"u8.ToArray());
@@ -496,11 +557,10 @@ public sealed class MsmtMessagePeerTests
         MsmtMessagePeer peerB = Listener(certificateB, trustedAuthorities);
         await using MsmtMessagePeer peerA = Sender(certificateA, trustedAuthorities);
         TaskCompletionSource received = new();
-        peerB.Receiver = async (source, identity, payload, isResponseRequested) =>
+        peerB.Receiver = (source, identity, payload, responder) =>
         {
+            payload.Dispose();
             received.TrySetResult();
-            await Task.Delay(Timeout.Infinite);
-            return MsmtReceiveResult.Accept();
         };
         peerB.StartListener(0, "127.0.0.1");
         Task<MsmtResponse> response = peerA.Request(Target(peerB), "hello"u8.ToArray());
@@ -519,10 +579,11 @@ public sealed class MsmtMessagePeerTests
         await using MsmtMessagePeer peerB = Listener(certificateB, trustedAuthorities);
         await using MsmtMessagePeer peerA = Sender(certificateA, trustedAuthorities);
         TaskCompletionSource<byte[]> received = new();
-        peerB.Receiver = (source, identity, payload, isResponseRequested) =>
+        peerB.Receiver = (source, identity, payload, responder) =>
         {
-            received.TrySetResult(payload.ToArray());
-            return new ValueTask<MsmtReceiveResult?>(MsmtReceiveResult.Accept());
+            received.TrySetResult(payload.Memory.ToArray());
+            payload.Dispose();
+            responder!.Accept();
         };
         peerB.StartListener(0, "127.0.0.1");
         byte[] payload = "hello"u8.ToArray();

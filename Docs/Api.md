@@ -25,7 +25,7 @@ be used in both directions, so it is the only place a connection is worth handin
 
 `IMsmtMessagePeer` and `IMsmtSessionPeer` both implement `IMsmtPeer`, which declares what they share and
 nothing else: a listener (`Listener`, `StartListener`, `StopListener`), tagged-send tracking
-(`PackageChanged`, `Packages`, `GetPackage`), and disposal. Code that only needs those - starting a
+(`PackageChanged`, `Packages`, `GetPackage`), the `Exceptions` observable, and disposal. Code that only needs those - starting a
 listener, or looking up a package by tag without caring which kind of peer sent it - can depend on
 `IMsmtPeer` directly; everything mode-specific (`Send`/`Request`/`Receiver` on a message peer; `Connect`,
 `Connected`, `Disconnected`, `Connections`, `Receiver` on a session peer) stays on its own interface.
@@ -33,9 +33,8 @@ listener, or looking up a package by tag without caring which kind of peer sent 
 A tagged send's progress is surfaced through the `PackageChanged` `IObservable<T>`, since it is fundamentally
 "notify me when X happens, possibly many times, for as long as I'm subscribed" - one queued payload can pass
 through several statuses over its lifetime. Receiving a message is the opposite shape: exactly one decision
-per message, awaited by whatever's sending it, so it is a single settable delegate property (`Receiver`,
-of type `MsmtMessageReceiver` or `MsmtSessionReceiver`) instead, invoked and awaited once per message
-received.
+per message, so it is a single settable delegate property (`Receiver`, of type `MsmtMessageReceiver` or
+`MsmtSessionReceiver`) instead, invoked once per message received.
 
 ## Peer message flow
 
@@ -44,8 +43,8 @@ received.
 2. The peer opens a connection to the target if its mode calls for one, exchanges the message, and
    `PackageChanged` publishes as the payload progresses - `Queued`, `Transmitting`, (for `Request` only)
    `PendingAcknowledgement`, then `Completed` - if the send was given a `Tag`. An untagged send skips this.
-3. On the remote peer, its `Receiver` is invoked and awaited once its listener has read the full message,
-   returning an `MsmtReceiveResult` that decides how to acknowledge it.
+3. On the remote peer, its `Receiver` is invoked once its listener has read the full message, handed an
+   `IMsmtResponder` to acknowledge it with, if the sender asked for that.
 4. Back on the sending side, `Request`'s `Task<MsmtResponse>` completes with the remote peer's decision and
    any payload it sent back. A plain `Send` never waits for this.
 
@@ -74,26 +73,28 @@ there is no separate "connect failed" event to watch in addition to it.
 
 ## Receiving and acknowledging
 
-A peer's `Receiver` (`MsmtMessageReceiver` or `MsmtSessionReceiver`) is invoked and awaited once per
-message, carrying the payload, the sender's address and verified identity (or, for a session connection,
-the connection it arrived on), and whether the sender requested an acknowledgement
-(`isResponseRequested`). It returns an `MsmtReceiveResult?` deciding how to acknowledge the message: `null`
-if the sender never requested one - the only valid answer in that case, and it sends no acknowledgement at
-all, not even a wire-level one - or `MsmtReceiveResult.Accept()`/`.Reject()`, optionally with a payload of
-its own, when one was requested. Returning `null` when one was requested, or a non-null result when one
-wasn't, is an error, closing the connection with an `InvalidOperationException`. Different connections may
-invoke the same `Receiver` concurrently, so it must be safe to run at once for more than one message.
+A peer's `Receiver` (`MsmtMessageReceiver` or `MsmtSessionReceiver`) is a plain synchronous delegate invoked
+once per message, carrying the payload, the sender's address and verified identity (or, for a session connection,
+the connection it arrived on), and an `IMsmtResponder?`. The payload is an `IMemoryOwner<byte>` the receiver
+owns and disposes, as soon as it is finished with it. The responder is non-null exactly when the sender
+requested an acknowledgement: the application answers it, exactly once, with `Accept()` or `Reject()`,
+optionally with a payload of its own, and the call returns at once with the acknowledgement queued to be
+written. It is `null` when none was requested, in which case no acknowledgement is sent at all, not even a
+wire-level one. A second answer throws `InvalidOperationException`. Different connections may invoke the
+same `Receiver` concurrently, so it must be safe to run at once for more than one message.
 
-Deciding later - after awaiting something else first - is simply not returning until then: since `Receiver`
-is awaited, whatever the handler awaits before it returns is what "later" means, rather than a separate
-deferral mechanism. The sender's `ResponseTimeout` still bounds how long that may take. On a session
-connection the connection keeps reading meanwhile, so a message this side sent is still acknowledged.
+The receiver returning means nothing about whether the message was answered, and this is not checked:
+answering is up to the application, from any thread and at any time, inside the receiver or long after it
+returned, and it is the sender's `ResponseTimeout` that bounds a message that never is. The connection
+does stay open until a requested message has been answered, so answering later still reaches the sender,
+and an unanswered one keeps its connection from being evicted as idle. Messages on one connection are still
+handed to `Receiver` one at a time and in order, so a receiver that blocks holds up the ones behind it.
 
 ## Sending options and tracking
 
 A single MSMT message or acknowledgement carries at most `MsmtLimits.MaxPayloadLength` bytes (16 MiB - 1),
-the largest length its header can declare. `Send`/`Request` and `MsmtReceiveResult`'s payload-carrying
-accept/reject overloads throw `ArgumentOutOfRangeException` for anything larger rather than transmitting a
+the largest length its header can declare. `Send`/`Request` and `IMsmtResponder`'s payload-carrying
+accept/reject methods throw `ArgumentOutOfRangeException` for anything larger rather than transmitting a
 message the remote peer would reject as malformed; bundle application-level messages to stay within it.
 
 `MsmtSendOptions` governs one queued payload: an optional `Tag` to identify it across `PackageChanged` and
@@ -113,3 +114,10 @@ callers and through the events to observers: a handshake that never completes, a
 a message that is never acknowledged. A cancelled `CancellationToken` surfaces as
 `OperationCanceledException`. A remote peer that rejects a message's header or does not support the mode
 fails the request with `InvalidOperationException`.
+
+Failures that don't end a connection have nowhere else to surface, so both peers publish them on
+`IMsmtPeer.Exceptions`: a `Receiver` that throws (which leaves its connection and later messages alone), a
+subscriber to `PackageChanged` or `Disconnected` that throws (which does not stop the other subscribers), a
+connection accepted by a message peer's listener that failed to establish, a failure evicting a connection,
+and a failed accept in the listener. One that ends a connection is reported through that connection's own
+`Disconnected` instead.

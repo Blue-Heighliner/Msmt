@@ -12,10 +12,11 @@ public sealed class MsmtReachabilityCheckerTests
         (X509Certificate2 certificateA, X509Certificate2 certificateB, X509Certificate2Collection trustedAuthorities) = TestMsmtCertificates.Create();
         await using MsmtMessagePeer peerB = Listener(certificateB, trustedAuthorities);
         int received = 0;
-        peerB.Receiver = (source, identity, payload, isResponseRequested) =>
+        peerB.Receiver = (source, identity, payload, responder) =>
         {
+            payload.Dispose();
             Interlocked.Increment(ref received);
-            return new ValueTask<MsmtReceiveResult?>(MsmtReceiveResult.Accept());
+            responder!.Accept();
         };
         peerB.StartListener(0, "127.0.0.1");
         IMsmtReachabilityChecker checker = new MsmtReachabilityChecker();

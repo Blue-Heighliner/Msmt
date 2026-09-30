@@ -95,10 +95,9 @@ public sealed class MsmtSessionLifecycleTests
         await using (listening)
         await using (connecting)
         {
-            listening.Receiver = async (connection, payload, isResponseRequested) =>
+            listening.Receiver = (connection, payload, responder) =>
             {
-                await Task.Delay(Timeout.Infinite);
-                return MsmtReceiveResult.Accept();
+                payload.Dispose();
             };
             Task<MsmtDisconnection> disconnected = WaitFor(connecting.Disconnected, args => args.Connection == connectingSide);
 
@@ -188,10 +187,11 @@ public sealed class MsmtSessionLifecycleTests
         await using (listening)
         await using (connecting)
         {
-            listening.Receiver = (connection, payload, isResponseRequested) =>
+            listening.Receiver = (connection, payload, responder) =>
             {
+                payload.Dispose();
                 Thread.Sleep(1500);
-                return new ValueTask<MsmtReceiveResult?>(MsmtReceiveResult.Accept());
+                responder!.Accept();
             };
 
             MsmtResponse response = await connectingSide.Request("hello"u8.ToArray()).WaitAsync(waitLimit);
@@ -231,11 +231,10 @@ public sealed class MsmtSessionLifecycleTests
         await using (connecting)
         {
             TaskCompletionSource received = new();
-            listening.Receiver = async (connection, payload, isResponseRequested) =>
+            listening.Receiver = (connection, payload, responder) =>
             {
+                payload.Dispose();
                 received.TrySetResult();
-                await Task.Delay(Timeout.Infinite);
-                return MsmtReceiveResult.Accept();
             };
             object tag = new();
             Task<MsmtResponse> request = connectingSide.Request("wait"u8.ToArray(), new MsmtSendOptions { Tag = tag });
@@ -297,15 +296,17 @@ public sealed class MsmtSessionLifecycleTests
             int received = 0;
             TaskCompletionSource firstReceived = new();
             TaskCompletionSource releaseFirst = new();
-            listening.Receiver = async (connection, payload, isResponseRequested) =>
+            listening.Receiver = (connection, payload, responder) =>
             {
+                payload.Dispose();
                 if (Interlocked.Increment(ref received) == 1)
                 {
                     firstReceived.TrySetResult();
-                    await releaseFirst.Task;
+                    _ = releaseFirst.Task.ContinueWith(_ => responder!.Accept(), TaskScheduler.Default);
+                    return;
                 }
 
-                return MsmtReceiveResult.Accept();
+                responder!.Accept();
             };
 
             Task<MsmtResponse> blocking = connectingSide.Request("first"u8.ToArray());
@@ -335,14 +336,15 @@ public sealed class MsmtSessionLifecycleTests
             List<string> order = [];
             TaskCompletionSource firstReceived = new();
             TaskCompletionSource releaseFirst = new();
-            listening.Receiver = async (connection, payload, isResponseRequested) =>
+            listening.Receiver = (connection, payload, responder) =>
             {
-                string text = Encoding.ASCII.GetString(payload.Span);
+                string text = Encoding.ASCII.GetString(payload.Memory.Span);
+                payload.Dispose();
                 if (text == "first")
                 {
                     firstReceived.TrySetResult();
-                    await releaseFirst.Task;
-                    return MsmtReceiveResult.Accept();
+                    _ = releaseFirst.Task.ContinueWith(_ => responder!.Accept(), TaskScheduler.Default);
+                    return;
                 }
 
                 lock (order)
@@ -350,7 +352,7 @@ public sealed class MsmtSessionLifecycleTests
                     order.Add(text);
                 }
 
-                return MsmtReceiveResult.Accept();
+                responder!.Accept();
             };
 
             Task<MsmtResponse> blocking = connectingSide.Request("first"u8.ToArray());

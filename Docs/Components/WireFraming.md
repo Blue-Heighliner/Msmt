@@ -9,7 +9,7 @@ Every message and acknowledgement is a fixed 10-byte `MsmtHeader` (1-byte versio
 opaque payload of that length. `MsmtHeader.SupportedVersion` is `3` (MSMT v1.2, with the Message ID field);
 `IsWellFormed()` rejects any other version, any bit outside `DefinedFlags`, or a length beyond `MaxLength`
 (`0xFFFFFF`, exposed publicly as `MsmtLimits.MaxPayloadLength`), which `MsmtProtocol.ValidatePayloadLength`
-also enforces outbound - at `Send`/`Request` and `MsmtReceiveResult.Accept`/`.Reject`, before a payload is
+also enforces outbound - at `Send`/`Request` and `IMsmtResponder.Accept`/`.Reject`, before a payload is
 queued or written - so an oversized payload fails fast with an `ArgumentOutOfRangeException` instead of
 being transmitted and then rejected as malformed mid-connection. `Acknowledges` matches a response header back to
 its request by version and message ID. `MsmtMessageFlags` is a `[Flags]` enum whose bits are combined for

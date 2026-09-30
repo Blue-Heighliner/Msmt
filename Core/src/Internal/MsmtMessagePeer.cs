@@ -21,6 +21,7 @@ internal sealed class MsmtMessagePeer : IMsmtMessagePeer
     {
         options.Validate();
         this.options = options;
+        packageChanged = new MsmtEventSubject<MsmtPackageChange>(Report);
         connector = new MsmtConnector(options, options.RequireFullyQualifiedHostname);
         eviction = new MsmtEviction(options.MaxIdleTime, options.MaxConnectionCount);
         CancellationToken cancellation = disposalCancellation.Token;
@@ -33,7 +34,8 @@ internal sealed class MsmtMessagePeer : IMsmtMessagePeer
     private readonly IMsmtPackageTracker packageTracker = new MsmtPackageTracker();
     private readonly ConcurrentDictionary<(string Host, int Port), MsmtTargetSender> senders = new();
     private readonly ConcurrentDictionary<MsmtConnection, byte> accepted = new();
-    private readonly MsmtEventSubject<MsmtPackageChange> packageChanged = new();
+    private readonly MsmtEventSubject<Exception> exceptions = new();
+    private readonly MsmtEventSubject<MsmtPackageChange> packageChanged;
     private readonly CancellationTokenSource disposalCancellation = new();
     private readonly TimeSpan evictionCheckInterval = TimeSpan.FromSeconds(1);
     private readonly Task evictionLoop;
@@ -43,6 +45,9 @@ internal sealed class MsmtMessagePeer : IMsmtMessagePeer
 
     /// <inheritdoc />
     public IObservable<MsmtPackageChange> PackageChanged => packageChanged;
+
+    /// <inheritdoc />
+    public IObservable<Exception> Exceptions => exceptions;
 
     /// <inheritdoc />
     public MsmtMessageReceiver? Receiver { get; set; }
@@ -73,7 +78,7 @@ internal sealed class MsmtMessagePeer : IMsmtMessagePeer
         MsmtListener newListener = new();
         try
         {
-            newListener.Start(host, port, OnAccepted, disposalCancellation.Token);
+            newListener.Start(host, port, OnAccepted, Report, disposalCancellation.Token);
         }
         catch
         {
@@ -248,17 +253,51 @@ internal sealed class MsmtMessagePeer : IMsmtMessagePeer
                 RekeyLimit = options.RekeyLimit,
             }, tracker: null, cancellation, OnReceived, onDisconnected: OnAcceptedDisconnected);
         }
-        catch (Exception)
+        catch (Exception exception)
         {
-            // A connection that never established is nobody's to report to: the peer exposes no connections.
+            // Reported here rather than on a connection, since the peer exposes none; a peer that is being
+            // disposed abandons handshakes still in progress on purpose, which is not worth reporting.
+            if (!cancellation.IsCancellationRequested)
+            {
+                Report(exception);
+            }
+
             return;
         }
 
         accepted[connection] = 0;
     }
 
-    private ValueTask<MsmtReceiveResult?> OnReceived(MsmtConnection connection, ReadOnlyMemory<byte> payload, bool isResponseRequested) =>
-        Receiver is null ? new ValueTask<MsmtReceiveResult?>(isResponseRequested ? MsmtReceiveResult.Accept() : null) : Receiver(connection.Remote, connection.Identity!, payload, isResponseRequested);
+    private void OnReceived(MsmtConnection connection, IMemoryOwner<byte> payload, IMsmtResponder? responder)
+    {
+        if (Receiver is null)
+        {
+            payload.Dispose();
+            responder?.Accept();
+            return;
+        }
+
+        try
+        {
+            Receiver(connection.Remote, connection.Identity!, payload, responder);
+        }
+        catch (Exception exception)
+        {
+            Report(exception);
+        }
+    }
+
+    private void Report(Exception exception)
+    {
+        try
+        {
+            exceptions.Publish(exception);
+        }
+        catch (Exception)
+        {
+            // A subscriber to the exceptions themselves throwing has nowhere left to be reported.
+        }
+    }
 
     private void OnAcceptedDisconnected(MsmtConnection connection, Exception? reason) => accepted.TryRemove(connection, out _);
 
@@ -274,6 +313,7 @@ internal sealed class MsmtMessagePeer : IMsmtMessagePeer
             catch (Exception exception) when (exception is not OperationCanceledException)
             {
                 // A failure evicting one connection must not end eviction for the life of the peer.
+                Report(exception);
             }
         }
     }

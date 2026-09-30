@@ -25,10 +25,12 @@ Reserving is what keeps the pool's eviction from retiring a sender between findi
 The peer's listener accepts sockets and hands each to a task of its own, so one client's stalled handshake
 never delays accepting the next. Each accepted connection is an acceptor that accepts requests and refuses a
 session negotiation, passing the peer's own `OnReceived` callback so a received message forwards straight
-to whatever `Receiver` is currently set, awaiting its `MsmtReceiveResult?` and returning it back to the
-connection - a connection carries no such event of its own to forward instead. The connection is tracked
-only for eviction and disposal. A connection that fails to establish is simply dropped, since a peer
-exposes no connections to report it on. Stopping the listener stops accepting and leaves connections
+to whatever `Receiver` is currently set, passing along the payload and responder - a connection carries no
+such event of its own to forward instead. With no `Receiver` set, the payload is disposed and a requested
+acknowledgement is accepted. The connection is tracked
+only for eviction and disposal. A connection that fails to establish is dropped and its failure published on the peer's
+`Exceptions`, since a peer exposes no connections to report it on. A `Receiver` that throws is published
+there too, and leaves the connection and later messages alone. Stopping the listener stops accepting and leaves connections
 already accepted alone.
 
 ## Eviction and disposal

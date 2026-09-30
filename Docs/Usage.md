@@ -24,11 +24,15 @@ using BlueHeighliner.Msmt;
 // address rather than a real DNS hostname; leave it enabled (the default) whenever a hostname is used.
 IMsmtMessagePeer peer = new IMsmtMessagePeer.Factory().Create(new MsmtMessagePeerOptions { Credentials = credentials, RequireFullyQualifiedHostname = false });
 
-// The peer disposes payload once this handler's returned ValueTask completes; copy anything needed beyond that.
-peer.Receiver = (source, identity, payload, isResponseRequested) =>
+// The handler owns payload and must dispose it; responder is null because this message never requested an acknowledgement.
+peer.Receiver = (source, identity, payload, responder) =>
 {
-    Console.WriteLine(Encoding.UTF8.GetString(payload.Span));
-    return default; // null: this message never requested an acknowledgement, so none is sent
+    using (payload)
+    {
+        Console.WriteLine(Encoding.UTF8.GetString(payload.Memory.Span));
+    }
+
+    return default;
 };
 
 peer.StartListener(port: 5000);
@@ -50,14 +54,17 @@ IMsmtMessagePeer.IFactory peerFactory = new IMsmtMessagePeer.Factory();
 // --- Receiving side ---
 IMsmtMessagePeer server = peerFactory.Create(new MsmtMessagePeerOptions { Credentials = serverCredentials, RequireFullyQualifiedHostname = false });
 
-server.Receiver = (source, identity, payload, isResponseRequested) =>
+server.Receiver = (source, identity, payload, responder) =>
 {
-    Console.WriteLine($"{identity.Subject} sent {Encoding.UTF8.GetString(payload.Span)}");
+    using (payload)
+    {
+        Console.WriteLine($"{identity.Subject} sent {Encoding.UTF8.GetString(payload.Memory.Span)}");
+    }
 
-    // A message that requested an acknowledgement (the sender used Request, not Send) must get a non-null
-    // result back - MsmtReceiveResult.Accept() or .Reject(), optionally with a payload of its own - or the
-    // connection closes with an error; one that did not request one must get null, for the same reason.
-    return new ValueTask<MsmtReceiveResult?>(isResponseRequested ? MsmtReceiveResult.Accept() : null);
+    // responder is non-null only for a message that requested an acknowledgement (the sender used Request,
+    // not Send), and that message must be answered exactly once - Accept() or Reject(), optionally with a
+    // payload of its own - by you: nothing checks, and the sender waits until its ResponseTimeout otherwise.
+    responder?.Accept();
 };
 
 server.StartListener(port: 5000);
@@ -87,15 +94,20 @@ IMsmtSessionPeer listening = new IMsmtSessionPeer.Factory().Create(new MsmtSessi
 
 // Connected publishes before the connection starts delivering messages, so subscribing here misses nothing.
 listening.Connected.Subscribe(connection => connection.Send("welcome"u8.ToArray())); // the listening side can send too
-listening.Receiver = (connection, payload, isResponseRequested) => new ValueTask<MsmtReceiveResult?>(isResponseRequested ? MsmtReceiveResult.Accept("got it"u8.ToArray()) : null);
+listening.Receiver = (connection, payload, responder) =>
+{
+    payload.Dispose();
+    responder?.Accept("got it"u8.ToArray());
+};
 listening.Disconnected.Subscribe(args => Console.WriteLine($"{args.Connection.Remote.Host} closed: {args.Exception?.Message ?? "normally"}"));
 listening.StartListener(port: 5000);
 
 IMsmtSessionPeer connecting = new IMsmtSessionPeer.Factory().Create(new MsmtSessionPeerOptions { Credentials = clientCredentials });
-connecting.Receiver = (connection, payload, isResponseRequested) =>
+connecting.Receiver = (connection, payload, responder) =>
 {
     Console.WriteLine("listening side says something");
-    return default;
+    payload.Dispose();
+    responder?.Accept();
 };
 
 // Connect returns immediately, still MsmtConnectionStatus.Connecting: the TCP connect, TLS handshake, and
@@ -126,32 +138,48 @@ it. `IMsmtSessionPeer.Connections` snapshots what is open, including a connectio
 ## Deciding a response later
 
 ```csharp
-TaskCompletionSource<MsmtReceiveResult?> decision = new();
+IMsmtResponder? pending = null;
 
-peer.Receiver = async (source, identity, payload, isResponseRequested) => // or sessionPeer.Receiver
+peer.Receiver = (source, identity, payload, responder) => // or sessionPeer.Receiver
 {
-    if (!isResponseRequested)
-    {
-        return null;
-    }
-
-    return await decision.Task; // awaited here, not returned early - nothing else can decide on its behalf
+    payload.Dispose(); // no need to hold the payload while waiting
+    pending = responder; // null unless the sender used Request
 };
 
-// ...elsewhere, once ready to decide:
-decision.TrySetResult(MsmtReceiveResult.Accept());
+// ...elsewhere, once ready to decide - from any thread, inside the receiver or long after it returned:
+pending?.Accept("done"u8.ToArray());
 ```
 
-Since a receiver is awaited, deciding later is just awaiting whatever provides that decision - a
-`TaskCompletionSource`, a queue, another connection's own receiver - before returning, rather than
-returning early and handing the decision to something else. The sender's `ResponseTimeout` still applies
-while this is pending. On a session connection the connection keeps reading meanwhile, so a message this
-side sent is still acknowledged. If the peer shuts down first, the connection closes without acknowledging
-the message, and the sender's `Request` fails.
+A receiver is a plain synchronous callback and its returning means nothing about whether a message was
+answered, so deciding later is just keeping the responder and calling `Accept` or `Reject` on it, once,
+whenever the decision is made. Nothing checks that a requested message is ever answered: the sender's
+`ResponseTimeout` is what ends the wait for one that isn't, and the connection stays open until then, so
+an answer that does come in time still reaches the sender. A second answer throws
+`InvalidOperationException`. Messages on a connection are handed to the receiver one at a time, so one that
+blocks holds up the ones behind it, and anything slow is better handed off and answered afterward. On a
+session connection the connection keeps reading meanwhile, so a message this side sent is still
+acknowledged. If the peer shuts down first, the connection closes without acknowledging the message, and
+the sender's `Request` fails.
+
+## Reporting exceptions
+
+```csharp
+peer.Exceptions.Subscribe(exception => Console.Error.WriteLine(exception)); // sessionPeer.Exceptions works the same way
+```
+
+`Exceptions` on `IMsmtMessagePeer` and `IMsmtSessionPeer` publishes what goes wrong while processing
+something without breaking a connection, so it would otherwise disappear: a `Receiver` that throws, a
+subscriber to `PackageChanged` or `Disconnected` that throws, a connection accepted by a message peer's
+listener that failed to establish, a failure evicting a connection, and the listener failing to accept a
+client. A receiver that throws does not close its connection or stop later messages, and its message, if it
+requested an acknowledgement, is simply left unanswered. An exception that ends a connection is reported
+through that connection's `Disconnected` instead, and a `Connected` subscriber that throws still closes the
+connection it was given. `Exceptions` publishes synchronously on whichever thread met the exception, and a
+subscriber to it that throws is ignored.
 
 ## Sending with pooled memory
 
-`Send`/`Request` (and `MsmtReceiveResult.Accept`/`.Reject`), on peers and connections alike, each have two
+`Send`/`Request` (and `IMsmtResponder.Accept`/`.Reject`), on peers and connections alike, each have two
 overloads: one taking a `ReadOnlyMemory<byte>` (wrapped without copying, so it must not be mutated until the
 send completes; used above), and one taking ownership of an `IMemoryOwner<byte>`, avoiding an allocation per
 message for callers already using pooled buffers. The whole of the owner's `Memory` is sent, and
@@ -172,10 +200,10 @@ its pool, and the owner it was called on must not be disposed separately.
 
 A response's payload (`MsmtResponse.Payload`, returned by `Request`) is likewise a pooled
 `IMemoryOwner<byte>` whose ownership transfers to the caller, who should dispose it once done. An
-acknowledgement payload passed to `MsmtReceiveResult.Accept`/`.Reject` transfers ownership the same way,
-disposed once sent. A `Receiver`'s incoming payload is the exception: it is exposed as a `ReadOnlyMemory<byte>`
-backed by a buffer the connection still owns and disposes once the receiver's returned `ValueTask`
-completes, so a receiver must neither keep nor dispose it, and should copy anything it needs beyond that.
+acknowledgement payload passed to `IMsmtResponder.Accept`/`.Reject` transfers ownership the same way,
+disposed once sent. A `Receiver`'s incoming payload is likewise an `IMemoryOwner<byte>` whose ownership
+transfers to the receiver, which must dispose it, and can do so as soon as it has read what it needs -
+before answering, if it has to wait on something else first.
 
 ## Tracking a send with a tag
 

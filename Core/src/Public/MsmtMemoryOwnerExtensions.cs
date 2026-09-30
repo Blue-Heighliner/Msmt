@@ -12,8 +12,8 @@ public static class MsmtMemoryOwnerExtensions
         /// buffer, while disposing the returned owner still disposes this one, returning the whole buffer to
         /// its pool. Needed because <see cref="MemoryPool{T}.Rent"/> may return a larger buffer than
         /// requested, and the whole of an owner's memory is what <see cref="IMsmtMessagePeer.Send"/>, <see
-        /// cref="IMsmtMessagePeer.Request"/>, and <see cref="MsmtReceiveResult.Accept(IMemoryOwner{byte})"/>/<see
-        /// cref="MsmtReceiveResult.Reject(IMemoryOwner{byte})"/> transmit.
+        /// cref="IMsmtMessagePeer.Request"/>, and <see cref="IMsmtResponder.Accept"/>/<see
+        /// cref="IMsmtResponder.Reject"/> transmit.
         /// </summary>
         /// <param name="start">The offset of the first byte to expose.</param>
         /// <param name="length">The number of bytes to expose.</param>

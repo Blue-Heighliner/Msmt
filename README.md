@@ -31,11 +31,13 @@ MsmtCredentials credentials = MsmtCredentials.FromPemFiles("identity.pem", "iden
 // address rather than a real DNS hostname; leave it enabled (the default) whenever a hostname is used.
 IMsmtMessagePeer peer = new IMsmtMessagePeer.Factory().Create(new MsmtMessagePeerOptions { Credentials = credentials, RequireFullyQualifiedHostname = false });
 
-// The peer disposes payload once this handler's returned ValueTask completes; copy anything needed beyond that.
-peer.Receiver = (source, identity, payload, isResponseRequested) =>
+// The handler owns payload and must dispose it; responder is null because this message never requested an acknowledgement.
+peer.Receiver = (source, identity, payload, responder) =>
 {
-    Console.WriteLine(Encoding.UTF8.GetString(payload.Span));
-    return default; // null: this message never requested an acknowledgement, so none is sent
+    using (payload)
+    {
+        Console.WriteLine(Encoding.UTF8.GetString(payload.Memory.Span));
+    }
 };
 
 peer.StartListener(port: 5000);
@@ -47,19 +49,21 @@ receive over the same connection object.
 
 ```csharp
 IMsmtSessionPeer listening = new IMsmtSessionPeer.Factory().Create(new MsmtSessionPeerOptions { Credentials = credentials, RequireFullyQualifiedHostname = false });
-listening.Receiver = (connection, payload, isResponseRequested) =>
+listening.Receiver = (connection, payload, responder) =>
 {
-    Console.WriteLine($"got {payload.Length} bytes");
-    return default;
+    Console.WriteLine($"got {payload.Memory.Length} bytes");
+    payload.Dispose();
+    responder?.Accept(); // non-null only for a message sent with Request, which must be answered, once
 };
 listening.Connected.Subscribe(connection => connection.Send("welcome"u8.ToArray())); // the listening side can send too
 listening.StartListener(port: 5000);
 
 IMsmtSessionPeer connecting = new IMsmtSessionPeer.Factory().Create(new MsmtSessionPeerOptions { Credentials = credentials });
-connecting.Receiver = (connection, payload, isResponseRequested) =>
+connecting.Receiver = (connection, payload, responder) =>
 {
     Console.WriteLine("connecting side got a message");
-    return default;
+    payload.Dispose();
+    responder?.Accept();
 };
 IMsmtConnection connection = connecting.Connect(new MsmtNameTarget { Host = "127.0.0.1", Port = 5000, ServerName = "127.0.0.1" });
 await connection.Wait(); // still Connecting until this resolves

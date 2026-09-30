@@ -26,8 +26,10 @@ public interface IMsmtSessionPeer : IMsmtPeer
     /// <summary>
     /// Gets or sets the <see cref="MsmtSessionReceiver"/> invoked whenever any of this peer's connections
     /// receives a message from the remote peer; <see langword="null"/> (the default) accepts every message
-    /// automatically without reporting it anywhere. Different connections may invoke this concurrently, so
-    /// it must be safe to run at once for more than one message.
+    /// automatically without reporting it anywhere. Messages on one connection are delivered one at a time,
+    /// in order, but different connections may invoke this concurrently, so it must be safe to run at once
+    /// for more than one message. An exception it throws is published on <see
+    /// cref="IMsmtPeer.Exceptions"/> and leaves the connection alone.
     /// </summary>
     MsmtSessionReceiver? Receiver { get; set; }
 

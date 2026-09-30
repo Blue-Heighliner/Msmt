@@ -37,10 +37,11 @@ public sealed class MsmtSessionTests
         await using (connecting)
         {
             TaskCompletionSource<(string Text, MsmtTarget Source)> received = new();
-            listening.Receiver = (connection, payload, isResponseRequested) =>
+            listening.Receiver = (connection, payload, responder) =>
             {
-                received.TrySetResult((Encoding.UTF8.GetString(payload.Span), connection.Remote));
-                return new ValueTask<MsmtReceiveResult?>(MsmtReceiveResult.Accept("thanks"u8.ToArray()));
+                received.TrySetResult((Encoding.UTF8.GetString(payload.Memory.Span), connection.Remote));
+                payload.Dispose();
+                responder!.Accept("thanks"u8.ToArray());
             };
 
             MsmtResponse response = await connectingSide.Request("hello"u8.ToArray()).WaitAsync(waitLimit);
@@ -61,10 +62,11 @@ public sealed class MsmtSessionTests
         await using (listening)
         await using (connecting)
         {
-            connecting.Receiver = (connection, payload, isResponseRequested) =>
+            connecting.Receiver = (connection, payload, responder) =>
             {
-                Assert.Equal("from listener", Encoding.UTF8.GetString(payload.Span));
-                return new ValueTask<MsmtReceiveResult?>(MsmtReceiveResult.Accept("connecting side ack"u8.ToArray()));
+                Assert.Equal("from listener", Encoding.UTF8.GetString(payload.Memory.Span));
+                payload.Dispose();
+                responder!.Accept("connecting side ack"u8.ToArray());
             };
 
             MsmtResponse response = await listeningSide.Request("from listener"u8.ToArray()).WaitAsync(waitLimit);
@@ -82,10 +84,13 @@ public sealed class MsmtSessionTests
         await using (listening)
         await using (connecting)
         {
-            ValueTask<MsmtReceiveResult?> EchoSlowly(IMsmtConnection connection, ReadOnlyMemory<byte> payload, bool isResponseRequested)
+            void EchoSlowly(IMsmtConnection connection, IMemoryOwner<byte> payload, IMsmtResponder? responder)
             {
                 Thread.Sleep(50);
-                return new ValueTask<MsmtReceiveResult?>(MsmtReceiveResult.Accept(payload.ToArray()));
+                using (payload)
+                {
+                    responder!.Accept(payload.Memory.ToArray());
+                }
             }
 
             connecting.Receiver = EchoSlowly;
@@ -116,10 +121,10 @@ public sealed class MsmtSessionTests
         await using MsmtSessionPeer listening = new(Options(listeningCertificate, trustedAuthorities));
         await using MsmtSessionPeer connecting = new(Options(connectingCertificate, trustedAuthorities));
         TaskCompletionSource<string> received = new();
-        connecting.Receiver = (connection, payload, isResponseRequested) =>
+        connecting.Receiver = (connection, payload, responder) =>
         {
-            received.TrySetResult(Encoding.UTF8.GetString(payload.Span));
-            return default;
+            received.TrySetResult(Encoding.UTF8.GetString(payload.Memory.Span));
+            payload.Dispose();
         };
         listening.Connected.Subscribe(connection => connection.Send("welcome"u8.ToArray()));
         listening.StartListener(0, "127.0.0.1");
@@ -138,17 +143,21 @@ public sealed class MsmtSessionTests
         await using (listening)
         await using (connecting)
         {
-            TaskCompletionSource<MsmtReceiveResult> deferred = new();
+            TaskCompletionSource deferred = new();
             TaskCompletionSource deferredReady = new();
-            listening.Receiver = async (connection, payload, isResponseRequested) =>
+            listening.Receiver = (connection, payload, responder) =>
             {
-                if (Encoding.ASCII.GetString(payload.Span) == "reject")
+                using (payload)
                 {
-                    return MsmtReceiveResult.Reject("no"u8.ToArray());
+                    if (Encoding.ASCII.GetString(payload.Memory.Span) == "reject")
+                    {
+                        responder!.Reject("no"u8.ToArray());
+                        return;
+                    }
                 }
 
                 deferredReady.TrySetResult();
-                return await deferred.Task;
+                _ = deferred.Task.ContinueWith(_ => responder!.Accept("done"u8.ToArray()), TaskScheduler.Default);
             };
 
             MsmtResponse rejected = await connectingSide.Request("reject"u8.ToArray()).WaitAsync(waitLimit);
@@ -159,8 +168,40 @@ public sealed class MsmtSessionTests
             await deferredReady.Task.WaitAsync(waitLimit);
             Assert.False(pending.IsCompleted);
 
-            deferred.TrySetResult(MsmtReceiveResult.Accept("done"u8.ToArray()));
+            deferred.TrySetResult();
             Assert.Equal("done", Encoding.ASCII.GetString((await pending.WaitAsync(waitLimit)).Payload.Memory.Span));
+        }
+    }
+
+    /// <summary>A receiver that throws is reported through the peer's exceptions, and the connection stays open for later messages.</summary>
+    [Fact]
+    public async Task Receiver_Throws_IsReportedAndConnectionStaysOpen()
+    {
+        (IMsmtSessionPeer listening, IMsmtSessionPeer connecting, IMsmtConnection connectingSide, IMsmtConnection listeningSide) = await ConnectPair();
+        await using (listening)
+        await using (connecting)
+        {
+            InvalidOperationException thrown = new("receiver failure");
+            Task<Exception> reported = WaitFor(listening.Exceptions);
+            listening.Receiver = (connection, payload, responder) =>
+            {
+                string text = Encoding.ASCII.GetString(payload.Memory.Span);
+                payload.Dispose();
+
+                if (text == "first")
+                {
+                    throw thrown;
+                }
+
+                responder!.Accept("ok"u8.ToArray());
+            };
+
+            connectingSide.Send("first"u8.ToArray());
+            MsmtResponse response = await connectingSide.Request("second"u8.ToArray()).WaitAsync(waitLimit);
+
+            Assert.Same(thrown, await reported);
+            Assert.Equal("ok", Encoding.ASCII.GetString(response.Payload.Memory.Span));
+            Assert.Equal(MsmtConnectionStatus.Connected, listeningSide.Status);
         }
     }
 
@@ -187,8 +228,13 @@ public sealed class MsmtSessionTests
         {
             byte[] payload = new byte[4 * 1024 * 1024];
             new Random(3).NextBytes(payload);
-            listening.Receiver = (connection, receivedPayload, isResponseRequested) =>
-                new ValueTask<MsmtReceiveResult?>(MsmtReceiveResult.Accept(receivedPayload.ToArray()));
+            listening.Receiver = (connection, receivedPayload, responder) =>
+            {
+                using (receivedPayload)
+                {
+                    responder!.Accept(receivedPayload.Memory.ToArray());
+                }
+            };
 
             MsmtResponse response = await connectingSide.Request(payload).WaitAsync(waitLimit);
 
@@ -214,15 +260,17 @@ public sealed class MsmtSessionTests
             new Random(2).NextBytes(fromListening);
             TaskCompletionSource<byte[]> receivedByListening = new();
             TaskCompletionSource<byte[]> receivedByConnecting = new();
-            listening.Receiver = (connection, payload, isResponseRequested) =>
+            listening.Receiver = (connection, payload, responder) =>
             {
-                receivedByListening.TrySetResult(payload.ToArray());
-                return new ValueTask<MsmtReceiveResult?>(MsmtReceiveResult.Accept());
+                receivedByListening.TrySetResult(payload.Memory.ToArray());
+                payload.Dispose();
+                responder!.Accept();
             };
-            connecting.Receiver = (connection, payload, isResponseRequested) =>
+            connecting.Receiver = (connection, payload, responder) =>
             {
-                receivedByConnecting.TrySetResult(payload.ToArray());
-                return new ValueTask<MsmtReceiveResult?>(MsmtReceiveResult.Accept());
+                receivedByConnecting.TrySetResult(payload.Memory.ToArray());
+                payload.Dispose();
+                responder!.Accept();
             };
 
             Task<MsmtResponse> toListening = connectingSide.Request(fromConnecting);
@@ -244,8 +292,16 @@ public sealed class MsmtSessionTests
         await using (listening)
         await using (connecting)
         {
-            listening.Receiver = (connection, payload, isResponseRequested) => new ValueTask<MsmtReceiveResult?>(MsmtReceiveResult.Accept());
-            connecting.Receiver = (connection, payload, isResponseRequested) => new ValueTask<MsmtReceiveResult?>(MsmtReceiveResult.Accept());
+            listening.Receiver = (connection, payload, responder) =>
+            {
+                payload.Dispose();
+                responder!.Accept();
+            };
+            connecting.Receiver = (connection, payload, responder) =>
+            {
+                payload.Dispose();
+                responder!.Accept();
+            };
             object connectingTag = new();
             object listeningTag = new();
 
@@ -277,11 +333,10 @@ public sealed class MsmtSessionTests
         await using (connecting)
         {
             TaskCompletionSource received = new();
-            listening.Receiver = async (connection, payload, isResponseRequested) =>
+            listening.Receiver = (connection, payload, responder) =>
             {
+                payload.Dispose();
                 received.TrySetResult();
-                await Task.Delay(Timeout.Infinite);
-                return MsmtReceiveResult.Accept();
             };
             object tag = new();
 

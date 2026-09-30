@@ -5,7 +5,11 @@ namespace BlueHeighliner.Msmt.Internal;
 /// currently subscribed observer, with no buffering or replay for a late subscriber - equivalent to a
 /// plain multicast event, but exposed as an observable.
 /// </summary>
-internal sealed class MsmtEventSubject<T> : IObservable<T>
+/// <param name="onObserverError">
+/// Given an exception an observer throws while being published to, after which the remaining observers are
+/// still published to; <see langword="null"/> to let it propagate to the publisher instead.
+/// </param>
+internal sealed class MsmtEventSubject<T>(Action<Exception>? onObserverError = null) : IObservable<T>
 {
     private readonly Lock subscribersLock = new();
     private readonly List<IObserver<T>> subscribers = [];
@@ -22,7 +26,14 @@ internal sealed class MsmtEventSubject<T> : IObservable<T>
 
         foreach (IObserver<T> observer in snapshot)
         {
-            observer.OnNext(value);
+            try
+            {
+                observer.OnNext(value);
+            }
+            catch (Exception exception) when (onObserverError is not null)
+            {
+                onObserverError(exception);
+            }
         }
     }
 

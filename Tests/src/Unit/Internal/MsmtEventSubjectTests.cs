@@ -12,6 +12,33 @@ public sealed class MsmtEventSubjectTests
         Record.Exception(() => subject.Publish(1));
     }
 
+    /// <summary>With an error callback, an observer that throws is reported and the observers after it still receive the value.</summary>
+    [Fact]
+    public void Publish_ObserverThrowsWithErrorCallback_ReportsAndNotifiesTheRest()
+    {
+        List<Exception> reported = [];
+        MsmtEventSubject<int> subject = new(reported.Add);
+        List<int> received = [];
+        InvalidOperationException thrown = new("boom");
+        subject.Subscribe(new ThrowingObserver(thrown));
+        subject.Subscribe(new RecordingObserver<int>(received));
+
+        subject.Publish(7);
+
+        Assert.Same(thrown, Assert.Single(reported));
+        Assert.Equal([7], received);
+    }
+
+    /// <summary>Without an error callback, an observer's exception propagates to the publisher.</summary>
+    [Fact]
+    public void Publish_ObserverThrowsWithoutErrorCallback_Propagates()
+    {
+        MsmtEventSubject<int> subject = new();
+        subject.Subscribe(new ThrowingObserver(new InvalidOperationException("boom")));
+
+        Assert.Throws<InvalidOperationException>(() => subject.Publish(1));
+    }
+
     /// <summary>A subscriber added via <see cref="IObservable{T}.Subscribe"/> receives every subsequently published value.</summary>
     [Fact]
     public void Subscribe_ThenPublish_ObserverReceivesValue()
@@ -125,6 +152,19 @@ public sealed class MsmtEventSubjectTests
     private sealed class RecordingObserver<T>(List<T> received) : IObserver<T>
     {
         public void OnNext(T value) => received.Add(value);
+
+        public void OnError(Exception error)
+        {
+        }
+
+        public void OnCompleted()
+        {
+        }
+    }
+
+    private sealed class ThrowingObserver(Exception exception) : IObserver<int>
+    {
+        public void OnNext(int value) => throw exception;
 
         public void OnError(Exception error)
         {

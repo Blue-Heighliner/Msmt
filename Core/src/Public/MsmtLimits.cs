@@ -9,7 +9,7 @@ public static class MsmtLimits
     /// Gets the largest payload, in bytes, a single MSMT message or acknowledgement may carry. A peer
     /// rejects any message whose header declares a larger length as malformed, so <see
     /// cref="IMsmtMessagePeer.Send"/>, <see cref="IMsmtMessagePeer.Request"/>, and <see
-    /// cref="MsmtReceiveResult"/>'s accept/reject overloads all reject an oversized payload up front rather
+    /// cref="IMsmtResponder"/>'s accept/reject methods all reject an oversized payload up front rather
     /// than transmitting one the remote peer could never accept. Bundle application-level messages to stay
     /// within it, per the ICD's guidance on choosing a maximum bundle size.
     /// </summary>
